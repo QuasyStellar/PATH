@@ -1,0 +1,17 @@
+[Unit]
+Description=PATH Lists Update Engine
+After=path.service
+Requires=path.service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/path
+ExecStart=/root/path/process.py
+Restart=on-failure
+RestartSec=1h
+TimeoutSec=1h
+
+[Install]
+WantedBy=multi-user.target
