@@ -1,0 +1,6 @@
+.git
+.env
+setup/root/path/download/*
+setup/root/path/temp/*
+setup/root/path/result/*
+*.log
