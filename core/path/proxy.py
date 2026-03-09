@@ -46,6 +46,13 @@ class PathProxyResolver:
         self.nft_queue = asyncio.Queue()
         self.lock = asyncio.Lock()
         self.running = True
+        self.tasks = set()
+
+    def create_task(self, coro):
+        task = asyncio.create_task(coro)
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+        return task
 
     async def recover(self):
         log("RECOVERY", "Syncing state from kernel NFTables...")
@@ -234,7 +241,7 @@ class PathProxyResolver:
                 else:
                     fut = asyncio.get_event_loop().create_future()
                     self.inflight[q_key] = fut
-                    asyncio.create_task(self._fetch(q_key, data, fut, is_tcp))
+                    self.create_task(self._fetch(q_key, data, fut, is_tcp))
             resp = await fut
             if not resp:
                 return data
@@ -274,7 +281,7 @@ class UDP(asyncio.DatagramProtocol):
         self.transport = transport
 
     def datagram_received(self, data, addr):
-        asyncio.create_task(self.run(data, addr))
+        self.res.create_task(self.run(data, addr))
 
     async def run(self, data, addr):
         try:
@@ -346,11 +353,11 @@ async def main():
     loop = asyncio.get_running_loop()
     for s in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(
-            s, lambda s=s: asyncio.create_task(stop(s, loop, res))
+            s, lambda s=s: res.create_task(stop(s, loop, res))
         )
     await res.recover()
-    asyncio.create_task(res.cleanup())
-    asyncio.create_task(res.nft_worker())
+    res.create_task(res.cleanup())
+    res.create_task(res.nft_worker())
     await loop.create_datagram_endpoint(
         lambda: UDP(res), local_addr=(args.address, args.port)
     )
