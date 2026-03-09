@@ -26,7 +26,8 @@ chmod +x /root/path/*.sh /root/path/*.py
 IFACE=$(ip route get 1.2.3.4 2>/dev/null | awk '{print $5; exit}')
 [ -z "$IFACE" ] && IFACE=$(ip -4 route show | grep default | awk '{print $5}' | head -n 1)
 AUTO_EXT_IP=$(ip -4 addr show "$IFACE" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
-FINAL_EXT_IP=${EXTERNAL_IP:-$AUTO_EXT_IP}
+EXTERNAL_IP=${EXTERNAL_IP:-$AUTO_EXT_IP}
+export EXTERNAL_IP
 
 cat <<EOF > /root/path/.env
 PATH_DNS=${PATH_DNS:-1}
@@ -39,7 +40,7 @@ AGGREGATE_COUNT=${AGGREGATE_COUNT:-500}
 IP=${IP:-10}
 FAKE_IP=${FAKE_IP:-198.18}
 FAKE_IP6=${FAKE_IP6:-fd00:18::}
-EXTERNAL_IP=$FINAL_EXT_IP
+EXTERNAL_IP=$EXTERNAL_IP
 FAKE_NETMASK_V4=${FAKE_NETMASK_V4:-15}
 FAKE_NETMASK_V6=${FAKE_NETMASK_V6:-111}
 EOF
