@@ -6,10 +6,10 @@ ENV LC_ALL=C
 RUN apt-get update && apt-get install -y \
     curl gpg git idn socat lsb-release nftables \
     python3-dnslib python3-aiohttp python3-idna \
-    iproute2 procps cron supervisor \
+    iproute2 procps cron supervisor certbot \
     && curl -fL https://pkg.labs.nic.cz/gpg -o /etc/apt/keyrings/cznic-labs-pkg.gpg \
     && echo "deb [signed-by=/etc/apt/keyrings/cznic-labs-pkg.gpg] https://pkg.labs.nic.cz/knot-resolver $(lsb_release -cs) main" > /etc/apt/sources.list.d/cznic-labs-knot-resolver.list \
-    && apt-get update && apt-get install -y knot-resolver \
+    && apt-get update && apt-get install -y knot-resolver knot-resolver-module-http \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /usr/src/path/defaults /etc/knot-resolver /run/knot-resolver/control \
@@ -28,6 +28,6 @@ COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-EXPOSE 53/udp 53/tcp
+EXPOSE 53/udp 53/tcp 80 443
 
 ENTRYPOINT ["/entrypoint.sh"]

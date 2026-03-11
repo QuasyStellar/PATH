@@ -13,18 +13,24 @@ services:
       - ./result:/root/path/result
     environment:
       PATH_DNS: 1
+      IP: 10
+      FAKE_IP: "198.18"
+      FAKE_IP6: "fd00:18::"
+      EXTERNAL_IP: ""
+      AGGREGATE_COUNT: 500
+      FAKE_NETMASK_V4: 15
+      FAKE_NETMASK_V6: 111
       ROUTE_ALL: "n"
       BLOCK_ADS: "y"
       FILTER_CASINO: "y"
       ENABLE_IPV6: "y"
       PUBLIC_DNS: "n"
-      AGGREGATE_COUNT: 500
-      IP: 10
-      FAKE_IP: "198.18"
-      FAKE_NETMASK_V4: 15
-      FAKE_IP6: "fd00:18::"
-      FAKE_NETMASK_V6: 111
-      EXTERNAL_IP: ""
+      DOH_ENABLE: "n"
+      DOH_PORT: 443
+      DOH_DOMAIN: ""
+      DOH_GENERATE_CERT: "n"
+      DOH_CERT: ""
+      DOH_KEY: ""
     healthcheck:
       test: ["CMD", "python3", "-c", "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(2); s.connect(('127.0.0.1', 53)); s.send(b'\\x12\\x34\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x02ya\\x02ru\\x00\\x00\\x01\\x00\\x01'); data = s.recv(512); exit(0 if len(data) > 0 else 1)"]
       interval: 30s
