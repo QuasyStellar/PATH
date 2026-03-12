@@ -16,19 +16,7 @@ PATH is a high-performance, asynchronous DNS-based traffic routing and filtering
 
 ## Installation
 
-### 1. Native Installation (Ubuntu/Debian)
-
-Recommended for dedicated VPS/LXC environments running Ubuntu 22.04/24.04 or Debian 11/12.
-
-**One-line installer:**
-```bash
-bash <(wget -qO- https://raw.githubusercontent.com/QuasyStellar/PATH/main/setup.sh)
-```
-The script will prompt you for DNS resolver choices, IP ranges, and filtering preferences.
-
----
-
-### 2. Docker Deployment (Recommended)
+### Docker Deployment (Recommended)
 
 The fastest way to deploy PATH. All dependencies and configurations are pre-packaged.
 
@@ -39,7 +27,7 @@ wget -O docker-compose.yml https://raw.githubusercontent.com/QuasyStellar/PATH/m
 docker compose up -d
 ```
 
-### 3. Build Docker from Source
+### Build Docker from Source
 
 To customize the code or build your own image:
 1. Clone the repository:
@@ -99,5 +87,4 @@ Files in this directory should contain **URLs** pointing to raw text lists. The 
 
 ### Applying Changes
 Lists are updated automatically once a day. For manual synchronization:
-- **Native:** `/root/path/process.py`
 - **Docker:** `docker exec path /root/path/process.py`

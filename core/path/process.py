@@ -9,6 +9,7 @@ import time
 import ipaddress
 import shutil
 import idna
+import subprocess
 from pathlib import Path
 from multiprocessing import Pool, cpu_count
 from functools import lru_cache
@@ -30,7 +31,7 @@ CASINO_REGEX = re.compile(
     r"|poker.*dom|1.*win|crypto.*bos|free.*spin|fair.*spin|no.*deposit|igrovye|avtomaty"
     r"|bookmaker|zerkalo|official|slottica|sykaaa|admiral|pinup|pari.*match|betting|"
     r"partypoker|jackpot|bonus|azino|888.*starz|zooma|zenit|eldorado|slots|vodka|"
-    r"newretro|platinum|igrat|flagman|arkada|game.*top|vavada|joy.*casino|sol.*casino|"
+    r"newretro|platinum|flagman|arkada|game.*top|vavada|joy.*casino|sol.*casino|"
     r"roxb.*|riobet|fresh.*cas|izzy.*cas|legzo.*cas|volna.*cas|starda.*cas|drip.*cas|"
     r"\.bet$|\.casino$)",
     re.I,
@@ -122,7 +123,22 @@ class Processor:
         for d in [RESULT_DIR, DOWNLOAD_DIR]:
             d.mkdir(parents=True, exist_ok=True)
         self.cores = cpu_count()
+        self.pool = Pool(self.cores)
         self.stats = {"casino": 0}
+
+    def __del__(self):
+        if hasattr(self, "pool"):
+            self.pool.close()
+            self.pool.join()
+
+    def get_state_hash(self):
+        h = hashlib.md5()
+        for p in [SOURCES_DIR, MANUAL_DIR]:
+            for f in sorted(p.glob("*.txt")):
+                h.update(f.read_bytes())
+        for k, v in sorted(self.env.items()):
+            h.update(f"{k}={v}".encode())
+        return h.hexdigest()
 
     async def fetch(self, session, url, path):
         try:
@@ -132,11 +148,22 @@ class Processor:
                     if url.endswith(".gz"):
                         import gzip
                         data = gzip.decompress(data)
+                    
+                    if len(data) < 10:
+                        log("FETCHER", f"Skip {url}: too small ({len(data)} bytes)", "WARNING")
+                        return False
+                    
+                    low_data = data[:512].lower()
+                    if b"<html" in low_data or b"<!doctype" in low_data or b"<title" in low_data:
+                        log("FETCHER", f"Skip {url}: HTML detected instead of text", "WARNING")
+                        return False
+
                     with open(path, "wb") as f:
                         f.write(data)
                     return True
-        except Exception:
-            pass
+                log("FETCHER", f"Failed {url}: HTTP {r.status}", "WARNING")
+        except Exception as e:
+            log("FETCHER", f"Error {url}: {e}", "WARNING")
         if not url.startswith(PROXY_URL):
             try:
                 async with session.get(PROXY_URL + url, timeout=30) as resp:
@@ -186,8 +213,7 @@ class Processor:
         if not raw:
             return set()
         func = validate_ip if is_ip else validate_domain
-        with Pool(self.cores) as pool:
-            results = pool.map(func, raw)
+        results = self.pool.map(func, raw)
         valid = set()
         for r in results:
             if not r:
@@ -235,8 +261,41 @@ class Processor:
                 ))
         return sorted(res)
 
+    def sync_to_knot(self):
+        log("SYNC", "Syncing RPZ zones to DNS server...")
+        changed = False
+        for z in ["deny", "deny2", "proxy"]:
+            src = RESULT_DIR / f"{z}.rpz"
+            dst = KNOT_DIR / f"{z}.rpz"
+            if src.exists():
+                if not dst.exists() or dst.stat().st_size != src.stat().st_size:
+                    shutil.copy2(src, dst)
+                    changed = True
+        
+        if changed:
+            for i in [1, 2]:
+                cmd = f"echo 'cache.clear()' | socat - unix-connect:/run/knot-resolver/control/{i}"
+                try:
+                    subprocess.run(cmd, shell=True, capture_output=True, timeout=5)
+                except Exception as e:
+                    log("SYNC", f"Failed to clear cache for instance {i}: {e}", "WARNING")
+
     def run(self):
-        log("ENGINE", "Processing started")
+        h_file = RESULT_DIR / ".hash"
+        new_h = self.get_state_hash()
+        
+        required_files = ["proxy.rpz", "deny.rpz"]
+        all_files_exist = all((RESULT_DIR / f).exists() for f in required_files)
+
+        if h_file.exists() and h_file.read_text() == new_h and all_files_exist:
+            log("ENGINE", "No changes detected and core files present, skipping generation")
+            self.sync_to_knot()
+            return
+
+        if not all_files_exist:
+            log("ENGINE", "Core RPZ files are missing, forcing regeneration")
+        else:
+            log("ENGINE", "Changes detected, starting processing")
         in_ips_raw = self.load(["include-ips"], is_ip=True)
         ex_ips_raw = self.load(["exclude-ips"], is_ip=True)
 
@@ -369,16 +428,10 @@ class Processor:
         changed = write_rpz("deny2", rpz2_h, set()) or changed
         changed = write_rpz("proxy", proxy_opt, excl_opt,
                            ra=(self.env.get("ROUTE_ALL") == "y")) or changed
-        if changed:
-            log("SYNC", "Applying changes to DNS server...")
-            for z in ["deny", "deny2", "proxy"]:
-                src = RESULT_DIR / f"{z}.rpz"
-                if src.exists():
-                    shutil.copy2(src, KNOT_DIR / f"{z}.rpz")
-            for i in [1, 2]:
-                cmd = (f"echo 'cache.clear()' | socat - "
-                       f"unix-connect:/run/knot-resolver/control/{i} >/dev/null 2>&1")
-                os.system(cmd)
+        
+        self.sync_to_knot()
+        
+        h_file.write_text(new_h)
         print("\n" + "=" * 45)
         print("         PATH (Policy-Aware Traffic Handler)")
         print("=" * 45)

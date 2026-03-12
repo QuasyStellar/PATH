@@ -7,7 +7,7 @@ import argparse
 import os
 import json
 import signal
-from collections import deque
+from collections import deque, OrderedDict
 from ipaddress import IPv4Network, IPv6Network
 from dnslib import DNSRecord, QTYPE, A, AAAA
 
@@ -33,14 +33,17 @@ class PathProxyResolver:
         self.enable_ipv6 = enable_ipv6
 
         self.ip_pool_v4 = deque([str(x) for x in IPv4Network(ip_range_v4).hosts()])
-        self.ip_map_v4 = {}
+        self.total_ips_v4 = len(self.ip_pool_v4)
+        self.ip_map_v4 = OrderedDict()
         self.fake_to_real_v4 = {}
 
         self.ip_pool_v6 = deque()
-        self.ip_map_v6 = {}
+        self.total_ips_v6 = 0
+        self.ip_map_v6 = OrderedDict()
         self.fake_to_real_v6 = {}
         if self.enable_ipv6:
             self.ip_pool_v6 = deque([str(x) for x in IPv6Network(ip_range_v6).hosts()])
+            self.total_ips_v6 = len(self.ip_pool_v6)
 
         self.inflight = {}
         self.nft_queue = asyncio.Queue()
@@ -65,10 +68,11 @@ class PathProxyResolver:
                 proc = await asyncio.create_subprocess_shell(
                     f"nft -j list map inet path {map_name}",
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
                 )
-                stdout, _ = await proc.communicate()
+                stdout, stderr = await proc.communicate()
                 if proc.returncode != 0:
+                    log("RECOVERY", f"NFT list {map_name} failed: {stderr.decode()}", "WARNING")
                     continue
                 data = json.loads(stdout.decode())
                 current_time = time.time()
@@ -126,14 +130,14 @@ class PathProxyResolver:
                     fake for op, ver, fake, real in items if op == "del" and ver == "v6"
                 ]
                 cmd = ""
-                if v4_add:
-                    cmd += f"add element inet path v4_map {{ {', '.join(v4_add)} }}\n"
                 if v4_del:
                     cmd += f"delete element inet path v4_map {{ {', '.join(v4_del)} }}\n"
-                if v6_add:
-                    cmd += f"add element inet path v6_map {{ {', '.join(v6_add)} }}\n"
+                if v4_add:
+                    cmd += f"add element inet path v4_map {{ {', '.join(v4_add)} }}\n"
                 if v6_del:
                     cmd += f"delete element inet path v6_map {{ {', '.join(v6_del)} }}\n"
+                if v6_add:
+                    cmd += f"add element inet path v6_map {{ {', '.join(v6_add)} }}\n"
                 if cmd:
                     proc = await asyncio.create_subprocess_shell(
                         "nft -f -",
@@ -161,10 +165,11 @@ class PathProxyResolver:
             pool = self.ip_pool_v6 if is_v6 else self.ip_pool_v4
             f2r = self.fake_to_real_v6 if is_v6 else self.fake_to_real_v4
             if real_ip in mapping:
+                mapping.move_to_end(real_ip)
                 mapping[real_ip]["last"] = time.time()
                 return mapping[real_ip]["fake"]
             if not pool:
-                oldest = min(mapping, key=lambda k: mapping[k]["last"])
+                oldest = next(iter(mapping.keys()))
                 fake_ip = mapping[oldest]["fake"]
                 self.nft_queue.put_nowait(
                     ("del", "v6" if is_v6 else "v4", fake_ip, oldest)
@@ -174,6 +179,7 @@ class PathProxyResolver:
                 pool.append(fake_ip)
             fake_ip = pool.popleft()
             mapping[real_ip] = {"fake": fake_ip, "last": time.time()}
+            mapping.move_to_end(real_ip)
             f2r[fake_ip] = real_ip
             self.nft_queue.put_nowait(("add", "v6" if is_v6 else "v4", fake_ip, real_ip))
             return fake_ip
@@ -202,6 +208,16 @@ class PathProxyResolver:
                         del f2r[fake]
             if cands:
                 log("CLEANUP", f"Evicted {len(cands)} expired IP mappings.")
+            
+            async with self.lock:
+                used_v4 = len(self.ip_map_v4)
+                perc_v4 = (used_v4 / self.total_ips_v4 * 100) if self.total_ips_v4 else 0
+                msg = f"Pool Usage: v4={used_v4}/{self.total_ips_v4} ({perc_v4:.1f}%)"
+                if self.enable_ipv6:
+                    used_v6 = len(self.ip_map_v6)
+                    perc_v6 = (used_v6 / self.total_ips_v6 * 100) if self.total_ips_v6 else 0
+                    msg += f", v6={used_v6}/{self.total_ips_v6} ({perc_v6:.1f}%)"
+                log("MONITOR", msg)
 
     async def resolve_up(self, data, is_tcp=False):
         try:

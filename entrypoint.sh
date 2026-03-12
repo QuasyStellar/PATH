@@ -99,6 +99,8 @@ DOH_CERT=$DOH_CERT
 DOH_KEY=$DOH_KEY
 EOF
 
+chmod 600 /root/path/.env
+
 cleanup() {
     echo -e "\n[$(date +'%H:%M:%S')] [INFO] SYSTEM | Container stopping, cleaning up..."
     /root/path/down.sh 2>/dev/null || true
