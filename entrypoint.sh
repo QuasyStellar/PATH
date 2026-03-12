@@ -40,6 +40,8 @@ export FAKE_IP6=${FAKE_IP6:-fd00:18::}
 export EXTERNAL_IP=${EXTERNAL_IP:-$AUTO_EXT_IP}
 export FAKE_NETMASK_V4=${FAKE_NETMASK_V4:-15}
 export FAKE_NETMASK_V6=${FAKE_NETMASK_V6:-111}
+export PROXY_ADDR=${PROXY_ADDR:-127.0.0.3}
+export PROXY_PORT=${PROXY_PORT:-53}
 
 export DOH_ENABLE=${DOH_ENABLE:-n}
 export DOH_PORT=${DOH_PORT:-443}
@@ -62,7 +64,7 @@ if [[ "$DOH_ENABLE" == "y" ]]; then
         DOH_KEY="/etc/letsencrypt/live/$DOH_DOMAIN/privkey.pem"
     fi
 
-    if [[ -n "$DOH_CERT" && -f "$DOH_CERT" ]]; then
+    if [[ -n "$DOH_CERT" && -f "$DOH_CERT" && -n "$DOH_KEY" && -f "$DOH_KEY" ]]; then
         cp -fL "$DOH_CERT" "$SSL_DIR/server.crt"
         cp -fL "$DOH_KEY" "$SSL_DIR/server.key"
         DOH_CERT="$SSL_DIR/server.crt"
@@ -78,23 +80,28 @@ if [[ "$DOH_ENABLE" == "y" ]]; then
     export DOH_CERT DOH_KEY
 fi
 
+NODE_ROLE=${NODE_ROLE:-solo}
 cat <<EOF > /root/path/.env
+NODE_ROLE=$NODE_ROLE
+REDIS_URL=$REDIS_URL
+REDIS_PASSWORD=$REDIS_PASSWORD
 PATH_DNS=$PATH_DNS
-IP=$IP
-FAKE_IP=$FAKE_IP
-FAKE_IP6=$FAKE_IP6
-EXTERNAL_IP=$EXTERNAL_IP
-AGGREGATE_COUNT=$AGGREGATE_COUNT
-FAKE_NETMASK_V4=$FAKE_NETMASK_V4
-FAKE_NETMASK_V6=$FAKE_NETMASK_V6
 ROUTE_ALL=$ROUTE_ALL
 BLOCK_ADS=$BLOCK_ADS
 FILTER_CASINO=$FILTER_CASINO
 ENABLE_IPV6=$ENABLE_IPV6
 PUBLIC_DNS=$PUBLIC_DNS
+AGGREGATE_COUNT=$AGGREGATE_COUNT
+IP=$IP
+EXTERNAL_IP=$EXTERNAL_IP
+FAKE_IP=$FAKE_IP
+FAKE_NETMASK_V4=$FAKE_NETMASK_V4
+FAKE_IP6=$FAKE_IP6
+FAKE_NETMASK_V6=$FAKE_NETMASK_V6
 DOH_ENABLE=$DOH_ENABLE
 DOH_PORT=$DOH_PORT
 DOH_DOMAIN=$DOH_DOMAIN
+DOH_GENERATE_CERT=$DOH_GENERATE_CERT
 DOH_CERT=$DOH_CERT
 DOH_KEY=$DOH_KEY
 EOF
@@ -106,13 +113,26 @@ cleanup() {
     /root/path/down.sh 2>/dev/null || true
     exit 0
 }
+
 trap cleanup SIGTERM SIGINT
 
-log "PATH initializing..."
+log "PATH initializing as ${NODE_ROLE^^}..."
 sysctl -p /etc/sysctl.d/99-path.conf || true
-rm -f /root/path/result/*.rpz
 
-DATA_COUNT=$(grep -v '^#' /root/path/lists/sources/*.txt /root/path/lists/manual/*.txt 2>/dev/null | grep -v '^[[:space:]]*$' | wc -l)
+if [[ "$NODE_ROLE" == "worker" ]]; then
+    sed -i '/\[program:cron\]/,$d' /etc/supervisor/conf.d/supervisord.conf
+    cat <<EOF >> /etc/supervisor/conf.d/supervisord.conf
+
+[program:sync-listener]
+command=/root/path/sync_listener.py
+autostart=true
+autorestart=true
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+EOF
+fi
 
 log "Starting PATH Engine..."
 /root/path/process.py
@@ -120,11 +140,15 @@ log "Starting PATH Engine..."
 log "Applying network routing rules..."
 /root/path/up.sh
 
-echo "0 3 * * * /root/path/process.py" | crontab -
+if [[ "$NODE_ROLE" != "worker" ]]; then
+    echo "0 3 * * * /root/path/process.py" | crontab -
+fi
 
 log "Starting PATH services via Supervisor..."
 
-if [ "$DATA_COUNT" -eq 0 ]; then
+DATA_COUNT=$(find /root/path/lists -name "*.txt" -exec grep -v '^#' {} + | grep -v '^[[:space:]]*$' | wc -l || echo 0)
+
+if [ "${DATA_COUNT:-0}" -eq 0 ]; then
     echo -e "\n\e[1;33m[WARNING] YOUR PROXY LISTS ARE EMPTY!\e[0m"
     echo -e "Add your sources to: \e[1;34m./lists/sources/\e[0m"
     echo -e "Add custom domains to: \e[1;34m./lists/manual/\e[0m"

@@ -5,7 +5,7 @@ ENV LC_ALL=C
 
 RUN apt-get update && apt-get install -y \
     curl gpg git idn socat lsb-release nftables \
-    python3-dnslib python3-aiohttp python3-idna \
+    python3-dnslib python3-aiohttp python3-idna python3-redis \
     iproute2 procps cron supervisor certbot \
     && curl -fL https://pkg.labs.nic.cz/gpg -o /etc/apt/keyrings/cznic-labs-pkg.gpg \
     && echo "deb [signed-by=/etc/apt/keyrings/cznic-labs-pkg.gpg] https://pkg.labs.nic.cz/knot-resolver $(lsb_release -cs) main" > /etc/apt/sources.list.d/cznic-labs-knot-resolver.list \

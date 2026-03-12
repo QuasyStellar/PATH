@@ -1,7 +1,7 @@
 name: path
 
 services:
-  core:
+  path:
     build: .
     image: quasystellaris/path:latest
     container_name: path
@@ -12,19 +12,22 @@ services:
       - ./lists:/root/path/lists
       - ./result:/root/path/result
     environment:
+      NODE_ROLE: "solo"
+      REDIS_URL: ""
+      REDIS_PASSWORD: ""
       PATH_DNS: 1
-      IP: 10
-      FAKE_IP: "198.18"
-      FAKE_IP6: "fd00:18::"
-      EXTERNAL_IP: ""
-      AGGREGATE_COUNT: 500
-      FAKE_NETMASK_V4: 15
-      FAKE_NETMASK_V6: 111
       ROUTE_ALL: "n"
       BLOCK_ADS: "y"
       FILTER_CASINO: "y"
       ENABLE_IPV6: "y"
       PUBLIC_DNS: "n"
+      AGGREGATE_COUNT: 500
+      IP: 10
+      EXTERNAL_IP: ""
+      FAKE_IP: "198.18"
+      FAKE_NETMASK_V4: 15
+      FAKE_IP6: "fd00:18::"
+      FAKE_NETMASK_V6: 111
       DOH_ENABLE: "n"
       DOH_PORT: 443
       DOH_DOMAIN: ""
@@ -37,3 +40,11 @@ services:
       timeout: 10s
       retries: 3
       start_period: 120s
+
+#  redis:
+#    image: redis:7-alpine
+#    container_name: path-redis
+#    restart: always
+#    command: redis-server --requirepass REPLACE_ME
+#    ports:
+#      - "6379:6379"

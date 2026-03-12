@@ -1,12 +1,22 @@
-# Temporary directories
-setup/root/antizapret/temp/
-setup/root/antizapret/result/
-setup/root/antizapret/download/
+# Core directories
+/lists/
+/result/
+/download/
+/temp/
 
-# Config files
-setup/root/antizapret/setup
+# Configuration
+.env
+*.env
 
-# Other
+# Python
+__pycache__/
+*.pyc
+
+# Logs and temp files
+*.log
 *.tmp
 *.gz
-*.log
+
+# System
+.DS_Store
+.ruff_cache/
