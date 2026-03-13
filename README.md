@@ -1,6 +1,6 @@
 # PATH (Policy-Aware Traffic Handler)
 
-PATH is a high-performance, asynchronous DNS-based traffic routing and filtering system. It leverages a modern Linux network stack comprising Python 3.12 (asyncio), Knot Resolver, and NFTables to implement transparent Fake-IP technology. 
+PATH is an industrial-grade, asynchronous DNS-based traffic routing and filtering system. It leverages a modern Linux network stack comprising Python 3.12 (asyncio), Knot Resolver, and NFTables to implement transparent Fake-IP technology at scale.
 
 The system redirects traffic destined for restricted resources through a gateway without necessitating the distribution of massive routing tables to client devices.
 
@@ -8,7 +8,7 @@ The system redirects traffic destined for restricted resources through a gateway
 
 ## Technical Features
 
-- **DNS-Based Proxying (Fake-IP):** Resolves targeted domains to a dedicated internal pool (`198.18.0.0/15` by default). Redirection occurs at the kernel level via NFTables DNAT.
+- **DNS-Based Proxying (Fake-IP):** Resolves targeted domains to dedicated internal pools (`198.18.0.0/15` and `fd00:18::/111`). Redirection occurs at the kernel level via NFTables DNAT.
 - **Constant-Time Operations (O(1)):**
     - **Routing Lookups:** NFTables Maps provide constant-time lookups regardless of the number of routed domains.
     - **IP Eviction:** Utilizes an O(1) LRU (Least Recently Used) algorithm for IP pool management, implemented via OrderedDict (Solo) or Lua scripting (Redis).
@@ -16,11 +16,11 @@ The system redirects traffic destined for restricted resources through a gateway
 - **Smart Hashing & Self-Healing:**
     - **Content-Aware Hashing:** Skips list processing and Trie generation only if the actual content of the downloaded lists is unchanged.
     - **Integrity Enforcement:** Automatically detects missing or corrupted RPZ files and triggers regeneration even if the state hash matches.
-- **Cluster Synchronization:** Shared state architecture across multiple nodes using Redis Pub/Sub and atomic Lua operations.
-- **Security Hardening:**
-    - **UDP Spoofing Protection:** Proxy engine validates DNS packet origins.
-    - **Redis Isolation:** Protected via mandatory authentication and NFTables-based source IP filtering.
-    - **Rate Limiting:** Integrated NFTables rules to mitigate DNS Amplification attacks.
+- **Cluster Synchronization:** Shared state architecture across multiple nodes using Redis Pub/Sub and targeted cache invalidation.
+- **Reliability Hardening:**
+    - **UDP TXID Isolation:** Every query uses a unique ephemeral socket to prevent response mixing.
+    - **TCP Fallback:** Automatically switches to TCP if the UDP response has the TC (Truncated) bit set.
+    - **Sync Jitter:** Randomized delays in cluster updates to prevent simultaneous "Sync Storms".
 
 ---
 
@@ -32,7 +32,7 @@ Suitable for single-server environments. Mappings and DNS zones are managed loca
 ### 2. Cluster (Docker Swarm)
 Distributed architecture for multi-node environments.
 - **Master Node:** Handles external list retrieval, Suffix Trie generation, RPZ compilation, and state distribution to Redis.
-- **Worker Nodes:** Edge nodes that pull configuration from Redis, subscribe to real-time state updates, and serve client requests.
+- **Worker Nodes:** Edge nodes that pull configuration from Redis, subscribe to real-time state updates, and serve client requests with sub-millisecond L1 cache.
 
 ---
 
@@ -45,8 +45,7 @@ Distributed architecture for multi-node environments.
    mkdir -p /opt/path && cd /opt/path
    wget https://raw.githubusercontent.com/QuasyStellar/PATH/main/docker-compose.yml
    ```
-2. **Configuration (Optional):** By default, Solo mode uses In-Memory storage. To enable Redis persistence, uncomment the `redis` service at the bottom of `docker-compose.yml` and provide a `REDIS_URL` and `REDIS_PASSWORD`.
-3. Launch:
+2. Launch:
    ```bash
    docker compose up -d
    ```
@@ -64,7 +63,6 @@ Distributed architecture for multi-node environments.
    ```bash
    docker swarm init --advertise-addr <MANAGER_IP>
    ```
-   *Copy the `docker swarm join` command from the output.*
 4. **Deploy the stack:**
    ```bash
    docker stack deploy -c docker-stack.yml path
@@ -80,21 +78,21 @@ Distributed architecture for multi-node environments.
 
 ## Configuration Reference
 
-Parameters are defined via environment variables in the YAML configuration files.
+Parameters are defined via environment variables in the YAML configuration files or a `.env` file.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `NODE_ROLE` | `solo` | Node behavior: `solo`, `master`, or `worker`. |
 | `REDIS_URL` | - | Redis connection string (e.g., `redis://127.0.0.1:6379`). |
-| `REDIS_PASSWORD`| - | **Required** password for Redis authentication. |
-| `PATH_DNS` | `1` | Upstream DNS provider (1-6). |
+| `REDIS_PASSWORD`| - | Required password for Redis authentication. |
+| `PATH_DNS` | `1` | Upstream DNS provider selection (1-6). |
 | `ROUTE_ALL` | `n` | If `y`, proxies ALL traffic except `exclude-hosts`. |
-| `BLOCK_ADS` | `y` | Enable/Disable Adblock (RPZ). |
-| `FILTER_CASINO` | `y` | Strip gambling domains from lists. |
-| `ENABLE_IPV6` | `y` | Enable dual-stack IPv6 support. |
-| `PUBLIC_DNS` | `n` | Allow DNS to listen on external IP. |
-| `AGGREGATE_COUNT`| `500` | Max number of IP prefixes in the routing table. |
-| `IP` | `10` | Base IP prefix for the local gateway. |
+| `BLOCK_ADS` | `y` | Enable/Disable Adblock filtering (RPZ). |
+| `FILTER_CASINO` | `y` | Aggressively strip gambling domains from all lists. |
+| `ENABLE_IPV6` | `y` | Enable dual-stack IPv6 support (DNS and routing). |
+| `PUBLIC_DNS` | `n` | Allow DNS to listen on external IP (Security risk). |
+| `AGGREGATE_COUNT`| `500` | Target limit for the number of IP prefixes in NFTables. |
+| `IP` | `10` | Base IP prefix for the local gateway (default: 10.77.77.77). |
 | `EXTERNAL_IP` | - | External IP of the server (auto-detected if empty). |
 | `FAKE_IP` | `198.18`| IPv4 prefix for the Fake-IP pool. |
 | `FAKE_NETMASK_V4`| `15` | CIDR mask for IPv4 Fake-IP range. |
@@ -113,27 +111,25 @@ Parameters are defined via environment variables in the YAML configuration files
 
 All configuration files are located in the `./lists` directory on the host machine.
 
-### 1. Manual Configurations (`lists/manual/`)
-- `include-hosts.txt`: Domains to be proxied.
-- `exclude-hosts.txt`: Domains to be excluded (Direct resolution).
-- `include-ips.txt`: Specific IP addresses or CIDR ranges for routing.
-- `include-adblock-hosts.txt`: Manual entries for DNS blocking.
+### Supported Formats
+- **Plain Domains:** `example.com`
+- **Adblock (DNS-level):** `||example.com^` (Contextual options like `$third-party` are ignored; only the domain is extracted).
+- **RPZ:** `example.com CNAME .`
+- **IP/CIDR:** `1.2.3.4` or `192.168.0.0/24`
 
-### 2. Automated Sources (`lists/sources/`)
-Populate these files with **URLs** pointing to raw text lists. The system performs automated updates daily at 03:00.
-
-### Forced Synchronization
-To apply list changes immediately:
-- **Standalone:** `docker exec path /root/path/process.py`
-- **Cluster:** Execute the above command on the **Master node**. Workers will synchronize state automatically.
+### Automatic Updates
+The system performs a full synchronization daily at 03:00. Manual trigger:
+```bash
+docker exec path /root/path/process.py
+```
 
 ---
 
 ## Security and Operational Requirements
 
-- **Privileges:** The container requires `privileged: true` and `network_mode: host` to manage NFTables and apply `sysctl` kernel optimizations (BBR, TCP buffer tuning).
-- **Data Protection:** The internal `.env` file is restricted to `600` permissions.
-- **Monitoring:** 
-    - Real-time logging: `docker logs -f path`
-    - Kernel state inspection: `docker exec path nft list map inet path v4_map`
-    - Pool utilization is logged during periodic cleanup cycles.
+- **Privileges:** Requires `privileged: true` and `network_mode: host` to manage NFTables and apply `sysctl` optimizations (BBR, TCP tuning).
+- **Monitoring & Logs:** 
+    - **Unified Logs:** `docker logs -f path`
+    - **IPv4 Routes:** `docker exec path nft list map inet path v4_map`
+    - **IPv6 Routes:** `docker exec path nft list map inet path v6_map`
+    - **Knot Stats:** `docker exec path sh -c "echo 'worker.stats()' | socat -T 1 - unix-connect:/run/knot-resolver/control/1"`

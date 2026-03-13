@@ -1,8 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -u
+
+import asyncio
 import os
-import subprocess
 import time
-import redis
+import subprocess
+import redis.asyncio as redis
+from pathlib import Path
 
 
 def log(msg, status="INFO"):
@@ -10,42 +13,46 @@ def log(msg, status="INFO"):
     print(f"[{t}] [{status:4}] {'CLUSTER_SYNC':15} | {msg}", flush=True)
 
 
-def main():
+async def main():
     redis_url = os.getenv("REDIS_URL")
     if not redis_url:
+        log("REDIS_URL not set, sync listener disabled", "WARNING")
         return
-    params = {}
+
     pw = os.getenv("REDIS_PASSWORD")
-    if pw:
-        params["password"] = pw
+    last_sync = 0
+    backoff = 1
+
+    current_dir = Path(__file__).parent.absolute()
+    process_script = current_dir / "process.py"
+
     while True:
         try:
-            r = redis.from_url(redis_url, **params)
-            pubsub = r.pubsub()
-            pubsub.subscribe("path:sync")
-            log("Started listening for cluster sync signals...")
-            break
-        except Exception as e:
-            log(f"Redis connection failed: {e}. Retrying in 5s...", "WARNING")
-            time.sleep(5)
+            r = redis.from_url(redis_url, password=pw, decode_responses=True)
+            async with r.pubsub() as pubsub:
+                await pubsub.subscribe("path:sync")
+                log(f"Subscribed to path:sync on {redis_url}")
+                backoff = 1
 
-    last_run = 0
-    for message in pubsub.listen():
-        if message["type"] == "message":
-            now = time.time()
-            if now - last_run < 5:
-                log("Update signal ignored (debounced)")
-                continue
-            log("Update signal received, triggering process.py...")
-            script_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "process.py"
-            )
-            subprocess.run([script_path])
-            last_run = time.time()
+                while True:
+                    msg = await pubsub.get_message(
+                        ignore_subscribe_messages=True, timeout=60
+                    )
+                    if msg and msg["data"] == "reload":
+                        now = time.time()
+                        if now - last_sync > 5:
+                            log("Sync signal received, triggering processing")
+                            subprocess.run([str(process_script)], check=False)
+                            last_sync = now
+                    await asyncio.sleep(0.1)
+        except Exception as e:
+            log(f"Connection lost: {e}. Retrying in {backoff}s...", "WARNING")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
 
 
 if __name__ == "__main__":
     try:
-        main()
+        asyncio.run(main())
     except KeyboardInterrupt:
         pass

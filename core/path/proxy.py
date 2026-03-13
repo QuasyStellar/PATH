@@ -16,7 +16,6 @@ import redis.asyncio as redis
 CLEANUP_INTERVAL = 1800
 CLEANUP_EXPIRY = 7200
 L1_CACHE_SIZE = 10000
-MAX_UPSTREAM_CONNS = 100
 
 
 def log(phase, msg, status="INFO"):
@@ -32,12 +31,14 @@ class IPManager:
         self.r = None
         self.l1_cache_v4 = OrderedDict()
         self.l1_cache_v6 = OrderedDict()
+        self.f2r_v4 = {}
+        self.f2r_v6 = {}
 
         if redis_url:
             try:
                 params = {
                     "decode_responses": True,
-                    "socket_timeout": 2,
+                    "socket_timeout": 5,
                     "retry_on_timeout": True,
                 }
                 pw = os.getenv("REDIS_PASSWORD")
@@ -60,13 +61,14 @@ class IPManager:
 
     async def get_fake_ip(self, real_ip, is_v6=False):
         cache = self.l1_cache_v6 if is_v6 else self.l1_cache_v4
-        f2r = self.resolver.fake_to_real_v6 if is_v6 else self.resolver.fake_to_real_v4
+        f2r = self.f2r_v6 if is_v6 else self.f2r_v4
 
         if real_ip in cache:
-            fake = cache[real_ip]
+            data = cache[real_ip]
+            fake = data["fake"]
             cache.move_to_end(real_ip)
-            if f2r.get(fake) != real_ip:
-                f2r[fake] = real_ip
+            data["last"] = time.time()
+            if self.resolver.known_kernel_state.get(fake) != real_ip:
                 self.resolver.enqueue_nft(
                     ("add", "v6" if is_v6 else "v4", fake, real_ip)
                 )
@@ -76,6 +78,11 @@ class IPManager:
         if self.is_cluster:
             try:
                 fake = await self._get_redis(real_ip, is_v6)
+                if not fake:
+                    await self.init_pool(
+                        list(self.resolver.ip_pool_v4), list(self.resolver.ip_pool_v6)
+                    )
+                    fake = await self._get_redis(real_ip, is_v6)
             except Exception:
                 pass
 
@@ -83,42 +90,49 @@ class IPManager:
             fake = await self._get_fake_local(real_ip, is_v6)
 
         if fake:
-            cache[real_ip] = fake
+            cache[real_ip] = {"fake": fake, "last": time.time()}
+            f2r[fake] = real_ip
             if len(cache) > L1_CACHE_SIZE:
-                cache.popitem(last=False)
+                old_real, d = cache.popitem(last=False)
+                old_fake = d["fake"]
+                if f2r.get(old_fake) == old_real:
+                    self.resolver.enqueue_nft(
+                        ("del", "v6" if is_v6 else "v4", old_fake, old_real)
+                    )
+                    del f2r[old_fake]
+                    if not self.is_cluster:
+                        (
+                            self.resolver.ip_pool_v6
+                            if is_v6
+                            else self.resolver.ip_pool_v4
+                        ).append(old_fake)
         return fake
 
     async def _get_fake_local(self, real_ip, is_v6=False):
         async with self.resolver.lock:
-            mapping = self.resolver.ip_map_v6 if is_v6 else self.resolver.ip_map_v4
+            cache = self.l1_cache_v6 if is_v6 else self.l1_cache_v4
+            f2r = self.f2r_v6 if is_v6 else self.f2r_v4
             pool = self.resolver.ip_pool_v6 if is_v6 else self.resolver.ip_pool_v4
-            f2r = (
-                self.resolver.fake_to_real_v6
-                if is_v6
-                else self.resolver.fake_to_real_v4
-            )
 
-            if real_ip in mapping:
-                mapping.move_to_end(real_ip)
-                mapping[real_ip]["last"] = time.time()
-                return mapping[real_ip]["fake"]
+            if real_ip in cache:
+                cache.move_to_end(real_ip)
+                return cache[real_ip]["fake"]
 
             if not pool:
-                if not mapping:
+                if not cache:
                     log("PROXY", "Critical: IP Pool exhausted!", "ERROR")
                     return None
-                oldest_real = next(iter(mapping.keys()))
-                oldest_fake = mapping[oldest_real]["fake"]
+                old_real = next(iter(cache.keys()))
+                old_fake = cache[old_real]["fake"]
                 self.resolver.enqueue_nft(
-                    ("del", "v6" if is_v6 else "v4", oldest_fake, oldest_real)
+                    ("del", "v6" if is_v6 else "v4", old_fake, old_real)
                 )
-                del mapping[oldest_real]
-                f2r.pop(oldest_fake, None)
-                pool.append(oldest_fake)
+                del cache[old_real]
+                del f2r[old_fake]
+                pool.append(old_fake)
 
             fake_ip = pool.popleft()
-            mapping[real_ip] = {"fake": fake_ip, "last": time.time()}
-            mapping.move_to_end(real_ip)
+            cache[real_ip] = {"fake": fake_ip, "last": time.time()}
             f2r[fake_ip] = real_ip
             self.resolver.enqueue_nft(
                 ("add", "v6" if is_v6 else "v4", fake_ip, real_ip)
@@ -164,13 +178,7 @@ class IPManager:
                 ver,
             )
             if fake:
-                f2r = (
-                    self.resolver.fake_to_real_v6
-                    if is_v6
-                    else self.resolver.fake_to_real_v4
-                )
-                if f2r.get(fake) != real_ip:
-                    f2r[fake] = real_ip
+                if self.resolver.known_kernel_state.get(fake) != real_ip:
                     self.resolver.enqueue_nft(("add", ver, fake, real_ip))
             return fake
         except Exception as e:
@@ -186,21 +194,18 @@ class IPManager:
                     await pubsub.subscribe("path:sync", "path:evict")
                     log("CLUSTER", "Listening for cluster sync signals...")
                     while True:
-                        msg = await pubsub.get_message(ignore_subscribe_messages=True)
+                        msg = await pubsub.get_message(
+                            ignore_subscribe_messages=True, timeout=60
+                        )
                         if msg:
                             if msg["channel"] == "path:sync":
-                                # Randomized debounce to prevent sync storms
                                 await asyncio.sleep(random.uniform(0.5, 5.0))
                                 await self.resolver.recover()
                             elif msg["channel"] == "path:evict":
                                 data = msg["data"]
                                 if isinstance(data, str) and ":" in data:
                                     fake, ver = data.split(":", 1)
-                                    f2r = (
-                                        self.resolver.fake_to_real_v6
-                                        if ver == "v6"
-                                        else self.resolver.fake_to_real_v4
-                                    )
+                                    f2r = self.f2r_v6 if ver == "v6" else self.f2r_v4
                                     real = f2r.pop(fake, None)
                                     if real:
                                         self.resolver.enqueue_nft(
@@ -262,12 +267,7 @@ class PathProxyResolver:
             if i >= v4_count:
                 break
             self.ip_pool_v4.append(str(addr))
-        self.ip_map_v4, self.fake_to_real_v4 = OrderedDict(), {}
-        self.ip_pool_v6, self.ip_map_v6, self.fake_to_real_v6 = (
-            deque(),
-            OrderedDict(),
-            {},
-        )
+        self.ip_pool_v6 = deque()
         if self.enable_ipv6:
             net_v6 = IPv6Network(ip_range_v6)
             for i, addr in enumerate(net_v6.hosts()):
@@ -275,38 +275,41 @@ class PathProxyResolver:
                     break
                 self.ip_pool_v6.append(str(addr))
 
-        self.nft_queue = None
-        self.lock = None
+        self.nft_queue = asyncio.Queue(maxsize=50000)
+        self.lock = asyncio.Lock()
         self.running = True
         self.ip_manager = IPManager(self, redis_url)
         self.udp_sock = None
+        self.known_kernel_state = {}
 
     def enqueue_nft(self, item):
-        if self.nft_queue:
-            try:
-                self.nft_queue.put_nowait(item)
-            except asyncio.QueueFull:
-                pass
+        try:
+            self.nft_queue.put_nowait(item)
+        except asyncio.QueueFull:
+            pass
 
     async def run_nft(self, lines):
         if not lines:
             return
         cmd = "\n".join(lines) + "\n"
-        proc = await asyncio.create_subprocess_exec(
-            "nft",
-            "-f",
-            "-",
+        proc = await asyncio.create_subprocess_shell(
+            "nft -f -",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
         _, stderr = await proc.communicate(input=cmd.encode())
-        if proc.returncode != 0:
+        if proc.returncode == 0:
             for line in lines:
-                p = await asyncio.create_subprocess_exec(
-                    "nft",
-                    "-f",
-                    "-",
+                parts = line.split()
+                if len(parts) >= 10 and parts[0] == "add":
+                    self.known_kernel_state[parts[6]] = parts[8]
+                elif len(parts) >= 8 and parts[0] == "delete":
+                    self.known_kernel_state.pop(parts[6], None)
+        else:
+            for line in lines:
+                p = await asyncio.create_subprocess_shell(
+                    "nft -f -",
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
@@ -321,7 +324,6 @@ class PathProxyResolver:
                 items = [item]
                 while not self.nft_queue.empty() and len(items) < 100:
                     items.append(self.nft_queue.get_nowait())
-
                 unique_adds = {}
                 unique_dels = set()
                 for op, ver, fake, real in items:
@@ -329,7 +331,6 @@ class PathProxyResolver:
                         unique_adds[(ver, fake)] = real
                     elif real:
                         unique_dels.add((ver, fake, real))
-
                 cmds = []
                 for (ver, fake), real in unique_adds.items():
                     cmds.append(
@@ -339,7 +340,6 @@ class PathProxyResolver:
                     cmds.insert(
                         0, f"delete element inet path {ver}_map {{ {fake} : {real} }}"
                     )
-
                 if cmds:
                     await self.run_nft(cmds)
                 for _ in items:
@@ -380,9 +380,6 @@ class PathProxyResolver:
     async def resolve_up(self, data, is_tcp=False):
         try:
             if is_tcp:
-                # Upstream TCP with timeout and connection reuse would be better,
-                # but for 127.0.0.2 a simple persistent-like behavior is hard without complex pooling.
-                # We at least ensure proper cleanup.
                 r, w = await asyncio.wait_for(
                     asyncio.open_connection(self.upstream_ip, self.upstream_port),
                     timeout=3.0,
@@ -397,46 +394,47 @@ class PathProxyResolver:
                 await w.wait_closed()
                 return res
             else:
-                if not self.udp_sock:
-                    self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    self.udp_sock.setblocking(False)
-                await asyncio.get_event_loop().sock_sendto(
-                    self.udp_sock, data, (self.upstream_ip, self.upstream_port)
-                )
-                res, _ = await asyncio.wait_for(
-                    asyncio.get_event_loop().sock_recvfrom(self.udp_sock, 4096),
-                    timeout=3.0,
-                )
-                return res
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setblocking(False)
+                try:
+                    loop = asyncio.get_event_loop()
+                    await loop.sock_sendto(
+                        sock, data, (self.upstream_ip, self.upstream_port)
+                    )
+                    res, _ = await asyncio.wait_for(
+                        loop.sock_recvfrom(sock, 65535), timeout=3.0
+                    )
+                    if DNSRecord.parse(res).header.tc:
+                        return await self.resolve_up(data, is_tcp=True)
+                    return res
+                finally:
+                    sock.close()
         except Exception:
             return None
 
     async def cleanup(self):
         while self.running:
             await asyncio.sleep(CLEANUP_INTERVAL)
-            if self.ip_manager.is_cluster:
+            mgr = self.ip_manager
+            if mgr.is_cluster:
                 continue
-            cands = []
             async with self.lock:
                 now = time.time()
-                for ver, mapping in [("v4", self.ip_map_v4), ("v6", self.ip_map_v6)]:
-                    for real, d in list(mapping.items()):
-                        if now - d["last"] > CLEANUP_EXPIRY:
-                            cands.append((ver, real, d["fake"]))
-            for ver, real, fake in cands:
-                async with self.lock:
-                    mapping = self.ip_map_v4 if ver == "v4" else self.ip_map_v6
-                    pool = self.ip_pool_v4 if ver == "v4" else self.ip_pool_v6
-                    f2r = self.fake_to_real_v4 if ver == "v4" else self.fake_to_real_v6
-                    if real in mapping and (
-                        time.time() - mapping[real]["last"] > CLEANUP_EXPIRY
-                    ):
-                        self.enqueue_nft(("del", ver, fake, real))
-                        pool.append(fake)
-                        del mapping[real]
+                for ver, cache in [("v4", mgr.l1_cache_v4), ("v6", mgr.l1_cache_v6)]:
+                    f2r, pool = (
+                        (mgr.f2r_v6 if ver == "v6" else mgr.f2r_v4),
+                        (self.ip_pool_v6 if ver == "v6" else self.ip_pool_v4),
+                    )
+                    to_del = [
+                        r for r, d in cache.items() if now - d["last"] > CLEANUP_EXPIRY
+                    ]
+                    for r in to_del:
+                        fake = cache[r]["fake"]
+                        self.enqueue_nft(("del", ver, fake, r))
+                        del cache[r]
                         del f2r[fake]
-            if cands:
-                log("CLEANUP", f"Evicted {len(cands)} mappings.")
+                        pool.append(fake)
+            log("CLEANUP", "Old mappings purged.")
 
     async def recover(self):
         log("RECOVERY", "Syncing state from kernel NFTables...")
@@ -470,45 +468,44 @@ class PathProxyResolver:
                                     actual_nft_v6[fake] = real
         except Exception:
             pass
-
         async with self.lock:
-            if not self.ip_manager.is_cluster:
+            mgr = self.ip_manager
+            self.known_kernel_state.clear()
+            if not mgr.is_cluster:
+                mgr.l1_cache_v4.clear()
+                mgr.f2r_v4.clear()
+                mgr.l1_cache_v6.clear()
+                mgr.f2r_v6.clear()
                 for fake, real in actual_nft_v4.items():
-                    self.fake_to_real_v4[fake], self.ip_map_v4[real] = (
-                        real,
+                    mgr.l1_cache_v4[real], mgr.f2r_v4[fake] = (
                         {"fake": fake, "last": time.time()},
+                        real,
                     )
+                    self.known_kernel_state[fake] = real
                 for fake, real in actual_nft_v6.items():
-                    self.fake_to_real_v6[fake], self.ip_map_v6[real] = (
-                        real,
+                    mgr.l1_cache_v6[real], mgr.f2r_v6[fake] = (
                         {"fake": fake, "last": time.time()},
+                        real,
                     )
+                    self.known_kernel_state[fake] = real
             else:
-                log("RECOVERY", "Syncing with Redis (Source of Truth)...")
+                log("RECOVERY", "Syncing state from Redis cluster...")
                 try:
                     for ver in ["v4", "v6"]:
-                        redis_data = await self.ip_manager.r.hgetall(f"path:map:{ver}")
-                        f2r = (
-                            self.fake_to_real_v6
-                            if ver == "v6"
-                            else self.fake_to_real_v4
-                        )
-                        mapping = self.ip_map_v6 if ver == "v6" else self.ip_map_v4
-                        l1 = (
-                            self.ip_manager.l1_cache_v6
-                            if ver == "v6"
-                            else self.ip_manager.l1_cache_v4
+                        redis_data = await mgr.r.hgetall(f"path:map:{ver}")
+                        f2r, cache = (
+                            (mgr.f2r_v6 if ver == "v6" else mgr.f2r_v4),
+                            (mgr.l1_cache_v6 if ver == "v6" else mgr.l1_cache_v4),
                         )
                         nft_cur = actual_nft_v6 if ver == "v6" else actual_nft_v4
                         f2r.clear()
-                        mapping.clear()
-                        l1.clear()
+                        cache.clear()
                         for real, fake in redis_data.items():
-                            f2r[fake], mapping[real], l1[real] = (
+                            f2r[fake], cache[real] = (
                                 real,
                                 {"fake": fake, "last": time.time()},
-                                fake,
                             )
+                            self.known_kernel_state[fake] = real
                             if nft_cur.get(fake) != real:
                                 self.enqueue_nft(("add", ver, fake, real))
                         for fake, real in nft_cur.items():
@@ -516,11 +513,7 @@ class PathProxyResolver:
                                 self.enqueue_nft(("del", ver, fake, real))
                 except Exception:
                     pass
-
-            occ_v4, occ_v6 = (
-                set(self.fake_to_real_v4.keys()),
-                set(self.fake_to_real_v6.keys()),
-            )
+            occ_v4, occ_v6 = set(mgr.f2r_v4.keys()), set(mgr.f2r_v6.keys())
             if occ_v4:
                 self.ip_pool_v4 = deque(
                     [ip for ip in self.ip_pool_v4 if ip not in occ_v4]
@@ -539,8 +532,7 @@ class UDP(asyncio.DatagramProtocol):
         self.transport = transport
 
     def datagram_received(self, data, addr):
-        if addr[0].startswith("127."):
-            asyncio.create_task(self.run(data, addr))
+        asyncio.create_task(self.run(data, addr))
 
     async def run(self, data, addr):
         resp = await self.resolver.patch(data)
@@ -585,13 +577,14 @@ async def main():
         ip_range_v4=f"{f4}.0.0/{m4}",
         ip_range_v6=f"{f6}/{m6}",
     )
-    resolver.nft_queue = asyncio.Queue(maxsize=50000)
-    resolver.lock = asyncio.Lock()
     asyncio.create_task(resolver.ip_manager.check_connection())
     asyncio.create_task(resolver.recover())
     asyncio.create_task(resolver.nft_worker())
     asyncio.create_task(resolver.cleanup())
     if resolver.ip_manager.is_cluster:
+        await resolver.ip_manager.init_pool(
+            list(resolver.ip_pool_v4), list(resolver.ip_pool_v6)
+        )
         asyncio.create_task(resolver.ip_manager.listen_updates())
     loop = asyncio.get_running_loop()
     await loop.create_datagram_endpoint(
