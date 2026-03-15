@@ -3,7 +3,7 @@ set -e
 
 log() { echo "[$(date +'%H:%M:%S')] [INFO] BOOTSTRAP | $1"; }
 
-mkdir -p /root/path/lists/manual /root/path/lists/sources /root/path/result /root/path/download /root/path/temp
+mkdir -p /root/path/lists/manual /root/path/lists/sources /root/path/result /root/path/download/temp
 
 for f in /usr/src/path/defaults/lists/sources/*.txt; do
     dst="/root/path/lists/sources/$(basename "$f")"
@@ -19,9 +19,9 @@ cp -f /usr/src/path/defaults/*.py /root/path/
 cp -f /usr/src/path/defaults/*.sh /root/path/
 chmod +x /root/path/*.sh /root/path/*.py
 
-IFACE=$(ip route get 1.2.3.4 2>/dev/null | awk '{print $5; exit}')
-[ -z "$IFACE" ] && IFACE=$(ip -4 route show | grep default | awk '{print $5}' | head -n 1)
-AUTO_EXT_IP=$(ip -4 addr show "$IFACE" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
+IFACE=$(ip -4 route show default | awk '{print $5}' | head -n 1)
+[[ -z "$IFACE" ]] && IFACE=$(ip -4 route show | grep default | awk '{print $5}' | head -n 1)
+AUTO_EXT_IP=$(ip -4 addr show dev "$IFACE" | awk '/inet / {print $2}' | cut -d/ -f1 | head -n 1)
 
 export PATH_DNS=${PATH_DNS:-1}
 export BLOCK_ADS=${BLOCK_ADS:-y}
