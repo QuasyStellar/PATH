@@ -1,38 +1,33 @@
 # PATH (Policy-Aware Traffic Handler)
 
-PATH is an industrial-grade, asynchronous DNS-based traffic routing and filtering system. It leverages a modern Linux network stack comprising Python 3.12 (asyncio), Knot Resolver, and NFTables to implement transparent Fake-IP technology at scale.
+PATH is an industrial-grade, asynchronous DNS-based traffic routing and filtering system. It leverages Python 3.12 (asyncio), Knot Resolver, and nftables to implement transparent Fake-IP routing at scale.
 
-The system redirects traffic destined for restricted resources through a gateway without necessitating the distribution of massive routing tables to client devices.
+It redirects traffic for selected domains through a gateway without distributing large routing tables to clients.
 
 ---
 
-## Technical Features
+## Quick Start (Docker Compose)
 
-- **DNS-Based Proxying (Fake-IP):** Resolves targeted domains to dedicated internal pools (`198.18.0.0/15` and `fd00:18::/111`). Redirection occurs at the kernel level via NFTables DNAT.
-- **Constant-Time Operations (O(1)):**
-    - **Routing Lookups:** NFTables Maps provide constant-time lookups regardless of the number of routed domains.
-    - **IP Eviction:** Utilizes an O(1) LRU (Least Recently Used) algorithm for IP pool management, implemented via OrderedDict (Solo) or Lua scripting (Redis).
-- **Suffix Trie Optimization:** High-efficiency domain collapsing algorithm that merges subdomains into wildcard entries (e.g., `*.google.com`), significantly reducing DNS zone size.
-- **Smart Hashing & Self-Healing:**
-    - **Content-Aware Hashing:** Skips list processing and Trie generation only if the actual content of the downloaded lists is unchanged.
-    - **Integrity Enforcement:** Automatically detects missing or corrupted RPZ files and triggers regeneration even if the state hash matches.
-- **Cluster Synchronization:** Shared state architecture across multiple nodes using Redis Pub/Sub and targeted cache invalidation.
-- **Reliability Hardening:**
-    - **UDP TXID Isolation:** Every query uses a unique ephemeral socket to prevent response mixing.
-    - **TCP Fallback:** Automatically switches to TCP if the UDP response has the TC (Truncated) bit set.
-    - **Sync Jitter:** Randomized delays in cluster updates to prevent simultaneous "Sync Storms".
+```bash
+mkdir -p /opt/path && cd /opt/path
+wget https://raw.githubusercontent.com/QuasyStellar/PATH/main/docker-compose.yml
+
+docker compose up -d
+```
 
 ---
 
 ## Deployment Modes
 
-### 1. Standalone (Solo)
-Suitable for single-server environments. Mappings and DNS zones are managed locally. Persistence can be enabled by providing a `REDIS_URL`.
+Standalone (solo). Suitable for a single server. DNS zones and mappings are managed locally. Optional Redis can be used for persistence.
 
-### 2. Cluster (Docker Swarm)
-Distributed architecture for multi-node environments.
-- **Master Node:** Handles external list retrieval, Suffix Trie generation, RPZ compilation, and state distribution to Redis.
-- **Worker Nodes:** Edge nodes that pull configuration from Redis, subscribe to real-time state updates, and serve client requests with sub-millisecond L1 cache.
+Cluster (Docker Swarm). Distributed setup for multiple nodes.
+
+Master node responsibilities: list retrieval, Suffix Trie generation, RPZ compilation, and pushing state to Redis.
+
+Worker node responsibilities: pulling state from Redis, subscribing to updates, serving DNS with a local L1 cache.
+
+In a cluster, list sources and manual lists are synced from the master to workers via Redis to keep failover consistent.
 
 ---
 
@@ -40,59 +35,74 @@ Distributed architecture for multi-node environments.
 
 ### Method 1: Standalone (Docker Compose)
 
-1. Create the working directory and retrieve the configuration:
-   ```bash
-   mkdir -p /opt/path && cd /opt/path
-   wget https://raw.githubusercontent.com/QuasyStellar/PATH/main/docker-compose.yml
-   ```
-2. Launch:
-   ```bash
-   docker compose up -d
-   ```
+1. Create the working directory and retrieve the configuration.
+```bash
+mkdir -p /opt/path && cd /opt/path
+wget https://raw.githubusercontent.com/QuasyStellar/PATH/main/docker-compose.yml
+```
+
+2. Launch.
+```bash
+docker compose up -d
+```
 
 ### Method 2: Cluster (Docker Swarm)
 
-#### Phase A: Master Node (Manager) Setup
-1. **Prepare the environment:**
-   ```bash
-   mkdir -p /opt/path && cd /opt/path
-   wget https://raw.githubusercontent.com/QuasyStellar/PATH/main/docker-stack.yml
-   ```
-2. **Configuration:** Edit `docker-stack.yml` and replace all `REPLACE_ME` placeholders with your secure Redis password.
-3. **Initialize the Swarm cluster:**
-   ```bash
-   docker swarm init --advertise-addr <MANAGER_IP>
-   ```
-4. **Deploy the stack:**
-   ```bash
-   docker stack deploy -c docker-stack.yml path
-   ```
+Phase A: Master Node (Manager) setup.
 
+1. Prepare the environment.
+```bash
+mkdir -p /opt/path && cd /opt/path
+wget https://raw.githubusercontent.com/QuasyStellar/PATH/main/docker-stack.yml
+```
 
-#### Phase B: Worker Node Setup
-1. Connect to the secondary server via SSH.
-2. Execute the `docker swarm join` command retrieved in Phase A.
-3. The Manager node will automatically deploy and synchronize the `worker` service to the new node.
+2. Edit `docker-stack.yml` and replace all `REPLACE_ME` placeholders with your Redis password.
+
+3. Initialize the Swarm cluster.
+```bash
+docker swarm init --advertise-addr <MANAGER_IP>
+```
+
+4. Deploy the stack.
+```bash
+docker stack deploy -c docker-stack.yml path
+```
+
+Phase B: Worker Node setup.
+
+1. SSH into the worker node.
+
+2. Run the `docker swarm join` command shown by the manager.
+
+3. The manager will deploy and synchronize the `worker` service automatically.
+
+---
+
+## Security and Operational Requirements
+
+Requires `privileged: true` and `network_mode: host` to manage nftables and apply sysctl tuning.
+
+If you set `PUBLIC_DNS=y`, the resolver will listen on the external interface. Only do this if you understand the exposure and have proper firewalling.
 
 ---
 
 ## Configuration Reference
 
-Parameters are defined via environment variables in the YAML configuration files or a `.env` file.
+Parameters are defined via environment variables in the YAML configuration files.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `NODE_ROLE` | `solo` | Node behavior: `solo`, `master`, or `worker`. |
 | `REDIS_URL` | - | Redis connection string (e.g., `redis://127.0.0.1:6379`). |
 | `REDIS_PASSWORD`| - | Required password for Redis authentication. |
-| `PATH_DNS` | `1` | Upstream DNS provider selection (1-6). |
+| `PATH_DNS` | `1` | Upstream DNS selection (1-6). See `PATH_DNS Sets` below. |
 | `ROUTE_ALL` | `n` | If `y`, proxies ALL traffic except `exclude-hosts`. |
 | `BLOCK_ADS` | `y` | Enable/Disable Adblock filtering (RPZ). |
 | `FILTER_CASINO` | `y` | Aggressively strip gambling domains from all lists. |
 | `ENABLE_IPV6` | `y` | Enable dual-stack IPv6 support (DNS and routing). |
-| `PUBLIC_DNS` | `n` | Allow DNS to listen on external IP (Security risk). |
-| `AGGREGATE_COUNT`| `500` | Target limit for the number of IP prefixes in NFTables. |
-| `IP` | `10` | Base IP prefix for the local gateway (default: 10.77.77.77). |
+| `PUBLIC_DNS` | `n` | Allow DNS to listen on external IP. |
+| `AGGREGATE_COUNT`| `500` | Target limit for the number of IP prefixes in nftables. |
+| `IP` | `10` | Base IPv4 prefix for the local gateway. Example: `10` becomes `10.77.77.77`. |
 | `EXTERNAL_IP` | - | External IP of the server (auto-detected if empty). |
 | `FAKE_IP` | `198.18`| IPv4 prefix for the Fake-IP pool. |
 | `FAKE_NETMASK_V4`| `15` | CIDR mask for IPv4 Fake-IP range. |
@@ -107,29 +117,88 @@ Parameters are defined via environment variables in the YAML configuration files
 
 ---
 
+### PATH_DNS Sets
+
+| `PATH_DNS` | Description | Upstream IPs |
+|-----------|-------------|--------------|
+| `1` | Cloudflare+Quad9 + MSK-IX+NSDI (recommended) [*] | `62.76.76.62`, `62.76.62.76`, `195.208.4.1`, `195.208.5.1` |
+| `2` | Cloudflare+Quad9 + SkyDNS [*][1] | `193.58.251.251` |
+| `3` | Cloudflare+Quad9 (use if previous choice fails) | `1.1.1.1`, `1.0.0.1`, `9.9.9.10`, `149.112.112.10` |
+| `4` | Comss [**] | `83.220.169.155`, `212.109.195.93`, `195.133.25.16` |
+| `5` | XBox [**] | `176.99.11.77`, `80.78.247.254`, `31.192.108.180` |
+| `6` | Malw [**] | `84.21.189.133`, `193.23.209.189` |
+
+| Note | Meaning |
+|------|---------|
+| [*] | DNS resolvers optimized for users located in Russia. |
+| [1] | Requires a SkyDNS account (Family plan) and adding this server IP in SkyDNS. |
+| [**] | Enable additional proxying and hide this server IP on some internet resources. Use only if this server is geolocated in Russia or you have problems accessing some internet resources. |
+
+---
+
+## DNS Filtering vs Proxy Routing
+
+DNS filtering uses RPZ zones to block or deny domains. Proxy routing resolves selected domains to Fake-IP pools and then DNATs traffic to real IPs in the kernel.
+
+`deny.rpz` and `deny2.rpz` are for blocking. `proxy.rpz` is for Fake-IP routing.
+
+---
+
 ## List Management
 
 All configuration files are located in the `./lists` directory on the host machine.
 
-### Supported Formats
-- **Plain Domains:** `example.com`
-- **Adblock (DNS-level):** `||example.com^` (Contextual options like `$third-party` are ignored; only the domain is extracted).
-- **RPZ:** `example.com CNAME .`
-- **IP/CIDR:** `1.2.3.4` or `192.168.0.0/24`
+Supported formats:
 
-### Automatic Updates
-The system performs a full synchronization daily at 03:00. Manual trigger:
+- Plain domains: `example.com`
+- Adblock (DNS-level): `||example.com^` (contextual options like `$third-party` are ignored; only the domain is extracted)
+- RPZ: `example.com CNAME .`
+- IP/CIDR: `1.2.3.4` or `192.168.0.0/24`
+
+Automatic updates run daily at 03:00. Manual trigger.
+
 ```bash
 docker exec path /root/path/process.py
 ```
 
 ---
 
-## Security and Operational Requirements
+## Health Checks and Verification
 
-- **Privileges:** Requires `privileged: true` and `network_mode: host` to manage NFTables and apply `sysctl` optimizations (BBR, TCP tuning).
-- **Monitoring & Logs:** 
-    - **Unified Logs:** `docker logs -f path`
-    - **IPv4 Routes:** `docker exec path nft list map inet path v4_map`
-    - **IPv6 Routes:** `docker exec path nft list map inet path v6_map`
-    - **Knot Stats:** `docker exec path sh -c "echo 'worker.stats()' | socat -T 1 - unix-connect:/run/knot-resolver/control/1"`
+Check nftables maps.
+
+```bash
+nft list map inet path v4_map
+nft list map inet path v6_map
+```
+
+Knot Resolver stats.
+
+```bash
+docker exec path sh -c "echo 'worker.stats()' | socat -T 1 - unix-connect:/run/knot-resolver/control/1"
+```
+
+---
+
+## Logs
+
+- Unified container logs: `docker logs -f path`
+
+---
+
+## Troubleshooting
+
+1. DNS does not respond on the local resolver.
+Check that the container is running with `network_mode: host` and `privileged: true`. Verify `kresd` is running in `docker logs -f path`.
+
+2. No routes are created in nftables maps.
+Run `/root/path/process.py` manually and check for errors. Confirm `ROUTE_ALL` or your include lists are not empty.
+
+3. `PATH_DNS=2` does not work.
+SkyDNS requires account activation and adding your server IP to their panel.
+
+4. IPv6 mapping is empty.
+Ensure `ENABLE_IPV6=y` and that your host supports IPv6. Also verify `FAKE_IP6` and `FAKE_NETMASK_V6`.
+
+5. Worker does not sync.
+Check Redis connectivity from the worker and confirm `REDIS_URL` and `REDIS_PASSWORD` are correct. Look for `path:hash` in Redis.

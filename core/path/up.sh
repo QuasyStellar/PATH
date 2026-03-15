@@ -2,17 +2,27 @@
 set -e
 cd "$(dirname "${BASH_SOURCE[0]}")"
 ./down.sh
-[[ -z "$FAKE_IP" ]] && [[ -f ".env" ]] && export $(grep -v '^#' .env | xargs)
+if [[ -f ".env" ]]; then
+    set -a
+    . ./.env
+    set +a
+fi
 ip addr add "${IP:-10}.77.77.77/32" dev lo || true
 for i in 1 2; do echo "cache.clear()" | socat - unix-connect:/run/knot-resolver/control/$i 2>/dev/null || true; done
 M4="${FAKE_NETMASK_V4:-15}"; M6="${FAKE_NETMASK_V6:-111}"
 F4="${FAKE_IP:-198.18}"; F6="${FAKE_IP6:-fd00:18::}"
-cat <<EOF > /tmp/path.nft
+NFT_TMP="$(mktemp /tmp/path.XXXXXX.nft)"
+cleanup_tmp() {
+    rm -f "$NFT_TMP"
+}
+trap cleanup_tmp EXIT
+cat <<EOF > "$NFT_TMP"
 table inet path {
-    map v4_map { type ipv4_addr : ipv4_addr; }
-    $( [[ "$ENABLE_IPV6" == "y" ]] && echo "map v6_map { type ipv6_addr : ipv6_addr; }" )
+    map v4_map { type ipv4_addr : ipv4_addr; flags timeout; }
+    $( [[ "$ENABLE_IPV6" == "y" ]] && echo "map v6_map { type ipv6_addr : ipv6_addr; flags timeout; }" )
     chain input {
         type filter hook input priority 0; policy accept;
+        iifname "lo" accept
         udp dport 53 meter dns_meter { ip saddr limit rate 50/second } accept
         udp dport 53 drop
     }
@@ -44,5 +54,5 @@ table inet path {
     }
 }
 EOF
-nft -f /tmp/path.nft && rm -f /tmp/path.nft
+nft -f "$NFT_TMP"
 exit 0
