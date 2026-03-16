@@ -54,7 +54,7 @@ def _normalize_domain_candidate(line):
 
 def log(phase, msg, status="INFO"):
     t = time.strftime("%H:%M:%S")
-    print(f"[{t}] [{status:4}] {phase:15} | {msg}", flush=True)
+    print(f"[{t}] {f'[{status}]':9} {phase:12} | {msg}", flush=True)
 
 
 def validate_domain(line):
@@ -329,8 +329,8 @@ class Processor:
 
         temp_download_dir = TEMP_DIR / "downloads"
         if temp_download_dir.exists():
-            shutil.rmtree(temp_download_dir)
-        temp_download_dir.mkdir(parents=True)
+            await asyncio.to_thread(shutil.rmtree, temp_download_dir)
+        await asyncio.to_thread(temp_download_dir.mkdir, parents=True)
 
         log("FETCHER", f"Checking updates for {len(url_map)} sources...")
         sem = asyncio.Semaphore(10)
@@ -345,8 +345,10 @@ class Processor:
                 if success:
                     main_path = paths[0]
                     for extra_path in paths[1:]:
-                        extra_path.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy(main_path, extra_path)
+                        await asyncio.to_thread(
+                            extra_path.parent.mkdir, parents=True, exist_ok=True
+                        )
+                        await asyncio.to_thread(shutil.copy, main_path, extra_path)
 
         if temp_download_dir.exists():
             updated_count = 0
@@ -358,8 +360,8 @@ class Processor:
 
                     dest_dir = DOWNLOAD_DIR / new_dir.name
                     if dest_dir.exists():
-                        shutil.rmtree(dest_dir)
-                    shutil.move(str(new_dir), str(dest_dir))
+                        await asyncio.to_thread(shutil.rmtree, dest_dir)
+                    await asyncio.to_thread(shutil.move, str(new_dir), str(dest_dir))
                     updated_count += 1
 
             if updated_count > 0:
@@ -369,12 +371,12 @@ class Processor:
                 )
 
         if TEMP_DIR.exists():
-            shutil.rmtree(TEMP_DIR)
+            await asyncio.to_thread(shutil.rmtree, TEMP_DIR)
 
     async def fetch(self, session, url, path, sem):
         async with sem:
             try:
-                path.parent.mkdir(parents=True, exist_ok=True)
+                await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
                 async with session.get(url, timeout=30) as r:
                     if r.status == 200:
                         data = await r.read()
@@ -390,17 +392,20 @@ class Processor:
                             return False
 
                         if path.exists():
-                            with open(path, "rb") as f_old:
-                                if (
-                                    hashlib.md5(data, usedforsecurity=False).hexdigest()
-                                    == hashlib.md5(
-                                        f_old.read(), usedforsecurity=False
-                                    ).hexdigest()
-                                ):
-                                    return True
+                            old_data = await asyncio.to_thread(path.read_bytes)
+                            if (
+                                hashlib.md5(data, usedforsecurity=False).hexdigest()
+                                == hashlib.md5(
+                                    old_data, usedforsecurity=False
+                                ).hexdigest()
+                            ):
+                                return True
 
-                        path.parent.mkdir(parents=True, exist_ok=True)
-                        path.write_bytes(data)
+                        await asyncio.to_thread(
+                            path.parent.mkdir, parents=True, exist_ok=True
+                        )
+                        await asyncio.to_thread(path.write_bytes, data)
+
                         return True
                     else:
                         log(
@@ -458,18 +463,27 @@ class Processor:
                 )
         return sorted(res)
 
-    def sync_to_knot(self):
+    async def sync_to_knot(self):
         log("SYNC", "Syncing RPZ zones to DNS server...")
         changed = False
         for z in ["deny", "deny2", "proxy"]:
             src, dst = RESULT_DIR / f"{z}.rpz", KNOT_DIR / f"{z}.rpz"
-            if src.exists():
-                if not dst.exists() or not filecmp.cmp(src, dst, shallow=False):
+
+            src_exists = await asyncio.to_thread(src.exists)
+            if src_exists:
+                dst_exists = await asyncio.to_thread(dst.exists)
+                is_same = False
+                if dst_exists:
+                    is_same = await asyncio.to_thread(
+                        filecmp.cmp, src, dst, shallow=False
+                    )
+
+                if not dst_exists or not is_same:
                     tmp_dst = dst.with_suffix(".tmp")
                     try:
-                        shutil.copy2(src, tmp_dst)
-                        os.chmod(tmp_dst, 0o644)
-                        tmp_dst.rename(dst)
+                        await asyncio.to_thread(shutil.copy2, src, tmp_dst)
+                        await asyncio.to_thread(os.chmod, tmp_dst, 0o644)
+                        await asyncio.to_thread(tmp_dst.rename, dst)
                         changed = True
                     except Exception as e:
                         log(
@@ -479,11 +493,13 @@ class Processor:
                         )
         if changed:
             ctrl_dir = "/run/knot-resolver/control"
-            if os.path.exists(ctrl_dir):
-                for s_name in os.listdir(ctrl_dir):
+            ctrl_exists = await asyncio.to_thread(os.path.exists, ctrl_dir)
+            if ctrl_exists:
+                for s_name in await asyncio.to_thread(os.listdir, ctrl_dir):
                     s_path = os.path.join(ctrl_dir, s_name)
                     try:
-                        subprocess.run(
+                        await asyncio.to_thread(
+                            subprocess.run,
                             ["socat", "-", f"unix-connect:{s_path}"],
                             input=b"cache.clear()\n",
                             capture_output=True,
@@ -651,10 +667,12 @@ class Processor:
                     all_ok = False
 
             if all_ok:
-                (RESULT_DIR / ".hash").write_text(
+                target_h = RESULT_DIR / ".hash"
+                tmp_h = target_h.with_suffix(".tmp")
+                tmp_h.write_text(
                     remote_h.decode() if isinstance(remote_h, bytes) else remote_h
                 )
-                self.sync_to_knot()
+                tmp_h.rename(target_h)
                 return True
             return False
 
@@ -662,7 +680,10 @@ class Processor:
             return False
 
     async def sync_from_redis(self):
-        return await asyncio.to_thread(self._sync_from_redis_blocking)
+        if await asyncio.to_thread(self._sync_from_redis_blocking):
+            await self.sync_to_knot()
+            return True
+        return False
 
     async def run(self):
         try:
@@ -772,7 +793,7 @@ class Processor:
                     ]
                 ):
                     log("ENGINE", "No changes detected, skipping generation")
-                    self.sync_to_knot()
+                    await self.sync_to_knot()
                     if self.r:
                         await self.sync_to_redis(new_h)
                     return
@@ -790,8 +811,16 @@ class Processor:
             final_v4 = sub_nets_optimized(self.aggregate(i_v4, limit, 4), e_v4)
             final_v6 = sub_nets_optimized(self.aggregate(i_v6, limit, 6), e_v6)
 
-            (RESULT_DIR / "route-ips.txt").write_text("\n".join(map(str, final_v4)))
-            (RESULT_DIR / "route-ips-v6.txt").write_text("\n".join(map(str, final_v6)))
+            for fname, nets in [
+                ("route-ips.txt", final_v4),
+                ("route-ips-v6.txt", final_v6),
+            ]:
+                target = RESULT_DIR / fname
+                tmp_target = target.with_suffix(".tmp")
+                await asyncio.to_thread(
+                    tmp_target.write_text, "\n".join(map(str, nets))
+                )
+                await asyncio.to_thread(tmp_target.rename, target)
 
             hosts_proxy_raw, c1 = self.load(["include-hosts", "rpz"])
             hosts_ad_raw, c2 = self.load(["include-adblock-hosts"])
@@ -815,37 +844,46 @@ class Processor:
             )
             ex_deny2 = ex_common | {d for d, ex in hosts_deny2_raw if ex}
 
-            proxy_domains = optimize_trie(
-                {d for d, ex in hosts_proxy_raw if not ex} - ex_proxy
-            )
-            adblock_domains = optimize_trie(
-                {d for d, ex in hosts_ad_raw if not ex} - ex_ad
-            )
-            deny2_domains = optimize_trie(
-                {d for d, ex in hosts_deny2_raw if not ex} - ex_deny2
-            )
+            proxy_raw = {d for d, ex in hosts_proxy_raw if not ex} - ex_proxy
+            adblock_raw = {d for d, ex in hosts_ad_raw if not ex} - ex_ad
+            deny2_raw = {d for d, ex in hosts_deny2_raw if not ex} - ex_deny2
+
+            proxy_raw = proxy_raw - adblock_raw - deny2_raw
+
+            proxy_domains = optimize_trie(proxy_raw)
+            adblock_domains = optimize_trie(adblock_raw)
+            deny2_domains = optimize_trie(deny2_raw)
 
             if self.env.get("ROUTE_ALL") == "y":
                 proxy_domains = ["."]
 
-            def write_rpz(name, domains, ra=False):
+            async def write_rpz(name, domains, ra=False):
                 out_path = RESULT_DIR / f"{name}.rpz"
-                with open(out_path, "w", encoding="utf-8") as f_out:
-                    f_out.write("$TTL 10800\n@ SOA . . (1 1 1 1 10800)\n")
-                    if ra and name == "proxy":
-                        f_out.write("* CNAME .\n")
-                    for d in sorted(domains):
-                        if d == ".":
-                            continue
-                        f_out.write(f"{d}. CNAME .\n")
-                        f_out.write(f"*.{d}. CNAME .\n")
+                tmp_path = out_path.with_suffix(".tmp")
 
-            write_rpz("proxy", proxy_domains, self.env.get("ROUTE_ALL") == "y")
-            write_rpz("deny", adblock_domains)
-            write_rpz("deny2", deny2_domains)
+                def _write():
+                    with open(tmp_path, "w", encoding="utf-8") as f_out:
+                        f_out.write("$TTL 10800\n@ SOA . . (1 1 1 1 10800)\n")
+                        if ra and name == "proxy":
+                            f_out.write("* CNAME .\n")
+                        for d in sorted(domains):
+                            if d == ".":
+                                continue
+                            f_out.write(f"{d}. CNAME .\n")
+                            f_out.write(f"*.{d}. CNAME .\n")
 
-            h_file.write_text(new_h)
-            self.sync_to_knot()
+                await asyncio.to_thread(_write)
+                await asyncio.to_thread(tmp_path.rename, out_path)
+
+            await write_rpz("proxy", proxy_domains, self.env.get("ROUTE_ALL") == "y")
+            await write_rpz("deny", adblock_domains)
+            await write_rpz("deny2", deny2_domains)
+
+            h_file_tmp = h_file.with_suffix(".tmp")
+            await asyncio.to_thread(h_file_tmp.write_text, new_h)
+            await asyncio.to_thread(h_file_tmp.rename, h_file)
+
+            await self.sync_to_knot()
             if self.r:
                 await self.sync_to_redis(new_h)
 

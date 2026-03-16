@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-log() { echo "[$(date +'%H:%M:%S')] [INFO] BOOTSTRAP | $1"; }
+log() { printf "[$(date +'%H:%M:%S')] %-9s %-12s | %s\n" "[INFO]" "BOOTSTRAP" "$1"; }
 
 mkdir -p /root/path/lists/manual /root/path/lists/sources /root/path/result /root/path/download/temp
 
@@ -102,14 +102,14 @@ EOF
 chmod 600 /root/path/.env
 
 cleanup() {
-    echo -e "\n[$(date +'%H:%M:%S')] [INFO] SYSTEM | Container stopping, cleaning up..."
+    printf "\n[$(date +'%H:%M:%S')] %-9s %-12s | %s\n" "[INFO]" "SYSTEM" "Container stopping, cleaning up..."
     /root/path/down.sh 2>/dev/null || true
     exit 0
 }
 trap cleanup SIGTERM SIGINT
 
 log "PATH initializing as ${NODE_ROLE^^}..."
-sysctl -p /etc/sysctl.d/99-path.conf || true
+sysctl -p /etc/sysctl.d/99-path.conf >/dev/null || true
 
 if [[ "$NODE_ROLE" == "worker" ]]; then
     sed -i '/\[program:cron\]/,$d' /etc/supervisor/conf.d/supervisord.conf

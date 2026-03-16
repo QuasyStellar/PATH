@@ -9,7 +9,7 @@ from pathlib import Path
 
 def log(msg, status="INFO"):
     t = time.strftime("%H:%M:%S")
-    print(f"[{t}] [{status:4}] {'CLUSTER_SYNC':15} | {msg}", flush=True)
+    print(f"[{t}] {f'[{status}]':9} {'CLUSTER_SYNC':12} | {msg}", flush=True)
 
 
 async def main():
@@ -21,6 +21,7 @@ async def main():
     pw = os.getenv("REDIS_PASSWORD")
     last_sync = 0
     last_check = 0
+    last_hb_check = time.time()
     backoff = 1
 
     current_dir = Path(__file__).parent.absolute()
@@ -42,6 +43,23 @@ async def main():
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop)
 
+    async def run_sync(reason):
+        nonlocal last_sync, last_hb_check
+        log(f"Triggering sync: {reason}")
+        proc = await asyncio.create_subprocess_exec(
+            str(process_script),
+            stdout=None,
+            stderr=None,
+        )
+        await proc.wait()
+        now = time.time()
+        if proc.returncode == 0:
+            log("Sync processing completed successfully")
+        else:
+            log(f"Sync processing failed with exit code {proc.returncode}", "ERROR")
+        last_sync = now
+        last_hb_check = now
+
     while running:
         try:
             async with redis.from_url(
@@ -62,60 +80,32 @@ async def main():
                                 data = data.decode()
 
                             if data == "reload":
-                                if role == "master":
-                                    continue
-                                now = time.time()
-                                if now - last_sync > 5:
-                                    log("Sync signal received, triggering processing")
-                                    proc = await asyncio.create_subprocess_exec(
-                                        str(process_script),
-                                        stdout=None,
-                                        stderr=None,
-                                    )
-                                    await proc.wait()
-                                    if proc.returncode == 0:
-                                        log("Sync processing completed successfully")
-                                    else:
-                                        log(
-                                            f"Sync processing failed with exit code {proc.returncode}",
-                                            "ERROR",
-                                        )
-                                    last_sync = now
+                                if role != "master":
+                                    now = time.time()
+                                    if now - last_sync > 5:
+                                        await run_sync("Pub/Sub reload signal")
+
                         now = time.time()
-                        if role != "master" and now - last_check > 60:
-                            last_check = now
-                            try:
-                                remote_h = await r.get("path:hash")
-                                if remote_h:
-                                    local_h = None
-                                    if hash_file.exists():
-                                        local_h = hash_file.read_text().strip()
-                                    if isinstance(remote_h, bytes):
-                                        remote_h = remote_h.decode()
-                                    if remote_h and remote_h != local_h:
-                                        if now - last_sync > 10:
-                                            log(
-                                                "Redis state changed, triggering processing",
-                                                "INFO",
-                                            )
-                                            proc = await asyncio.create_subprocess_exec(
-                                                str(process_script),
-                                                stdout=None,
-                                                stderr=None,
-                                            )
-                                            await proc.wait()
-                                            if proc.returncode == 0:
-                                                log(
-                                                    "Sync processing completed successfully"
-                                                )
-                                            else:
-                                                log(
-                                                    f"Sync processing failed with exit code {proc.returncode}",
-                                                    "ERROR",
-                                                )
-                                            last_sync = now
-                            except Exception:
-                                pass
+                        if role != "master":
+                            if now - last_check > 60:
+                                last_check = now
+                                try:
+                                    remote_h = await r.get("path:hash")
+                                    if remote_h:
+                                        local_h = None
+                                        if hash_file.exists():
+                                            local_h = hash_file.read_text().strip()
+                                        if isinstance(remote_h, bytes):
+                                            remote_h = remote_h.decode()
+                                        if remote_h and remote_h != local_h:
+                                            if now - last_sync > 10:
+                                                await run_sync("Redis hash changed")
+                                except Exception:
+                                    pass
+
+                            if now - last_hb_check > 900:
+                                await run_sync("Scheduled heartbeat check")
+
                         await asyncio.sleep(0.1)
         except Exception as e:
             if not running:

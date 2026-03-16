@@ -15,14 +15,13 @@ import redis.asyncio as redis
 
 CLEANUP_INTERVAL = 1800
 CLEANUP_EXPIRY = 7200
-L1_CACHE_SIZE = 100000
 
 
 def log(phase, msg, status="INFO"):
     if status == "DEBUG" and os.getenv("DEBUG") != "y":
         return
     t = time.strftime("%H:%M:%S")
-    print(f"[{t}] [{status:4}] {phase:15} | {msg}", flush=True)
+    print(f"[{t}] {f'[{status}]':9} {phase:12} | {msg}", flush=True)
 
 
 class IPManager:
@@ -101,18 +100,16 @@ class IPManager:
                 data = cache[real_ip]
                 now = time.time()
 
-                if now - data.get("last", 0) > 7200:
-                    fake = data["fake"]
+                if now - data[1] > 7200:
+                    fake = data[0]
                     cache.pop(real_ip, None)
                     f2r.pop(fake, None)
                 else:
-                    fake = data["fake"]
+                    fake = data[0]
                     cache.move_to_end(real_ip)
-                    data["last"] = now
-                    needs_kernel_refresh = now - data.get("kernel_update", 0) > 5400
-                    needs_redis_refresh = self.is_cluster and (
-                        now - data.get("redis_update", 0) > 1800
-                    )
+                    data[1] = now
+                    needs_kernel_refresh = now - data[2] > 5400
+                    needs_redis_refresh = self.is_cluster and (now - data[3] > 1800)
 
                     async with self.resolver.state_lock:
                         known_real = self.resolver.known_kernel_state.get(fake)
@@ -122,15 +119,15 @@ class IPManager:
                         if known_real:
                             self.resolver.enqueue_nft(("del", ver, fake, known_real))
                         self.resolver.enqueue_nft(("add", ver, fake, real_ip))
-                        data["kernel_update"] = now
+                        data[2] = now
                     elif needs_kernel_refresh:
                         self.resolver.enqueue_nft(("del", ver, fake, real_ip))
                         self.resolver.enqueue_nft(("add", ver, fake, real_ip))
-                        data["kernel_update"] = now
+                        data[2] = now
 
                     if needs_redis_refresh:
-                        self.redis_touch_queue.add((fake, ver))
-                        data["redis_update"] = now
+                        self.redis_touch_queue.add((real_ip, fake, ver))
+                        data[3] = now
                     return fake
 
             if real_ip in self._inflight:
@@ -165,32 +162,13 @@ class IPManager:
                         if old_real and old_real != real_ip:
                             cache.pop(old_real, None)
                         now = time.time()
-                        cache[real_ip] = {
-                            "fake": fake,
-                            "last": now,
-                            "kernel_update": now,
-                            "redis_update": now,
-                        }
+                        cache[real_ip] = [fake, now, now, now]
                         f2r[fake] = real_ip
-                        if len(cache) > L1_CACHE_SIZE:
+                        if self.is_cluster and len(cache) > self.resolver.l1_limit:
                             old_real_evict, d = cache.popitem(last=False)
-                            old_fake = d["fake"]
+                            old_fake = d[0]
                             if f2r.get(old_fake) == old_real_evict:
-                                self.resolver.enqueue_nft(
-                                    (
-                                        "del",
-                                        "v6" if is_v6 else "v4",
-                                        old_fake,
-                                        old_real_evict,
-                                    )
-                                )
                                 del f2r[old_fake]
-                                if not self.is_cluster:
-                                    (
-                                        self.resolver.ip_pool_v6
-                                        if is_v6
-                                        else self.resolver.ip_pool_v4
-                                    ).append(old_fake)
             return fake
         finally:
             async with self.resolver.lock:
@@ -199,6 +177,13 @@ class IPManager:
                     ev.set()
 
     async def redis_touch_worker(self):
+        lua_touch = """
+        if redis.call('HGET', KEYS[1], ARGV[1]) == ARGV[2] then
+            redis.call('ZADD', KEYS[2], ARGV[3], ARGV[2])
+            return 1
+        end
+        return 0
+        """
         while self.resolver.running:
             try:
                 await asyncio.sleep(30)
@@ -208,11 +193,20 @@ class IPManager:
                     to_touch = list(self.redis_touch_queue)
                     self.redis_touch_queue = set()
                 if to_touch:
-                    async with self.r.pipeline() as pipe:
-                        now = time.time()
-                        for fake, ver in to_touch:
-                            pipe.zadd(f"path:exp:{ver}", {fake: now})
-                        await pipe.execute()
+                    now = time.time()
+                    for real, fake, ver in to_touch:
+                        try:
+                            await self.r.eval(
+                                lua_touch,
+                                2,
+                                f"path:map:{ver}",
+                                f"path:exp:{ver}",
+                                real,
+                                fake,
+                                now,
+                            )
+                        except Exception:
+                            continue
             except Exception as e:
                 log("CLUSTER", f"Touch worker error: {e}", "WARNING")
 
@@ -284,13 +278,13 @@ class IPManager:
             pool = self.resolver.ip_pool_v6 if is_v6 else self.resolver.ip_pool_v4
             if real_ip in cache:
                 cache.move_to_end(real_ip)
-                return cache[real_ip]["fake"]
+                return cache[real_ip][0]
             if not pool:
                 if not cache:
                     log("PROXY", "Critical: IP Pool exhausted!", "ERROR")
                     return None
                 old_real = next(iter(cache.keys()))
-                old_fake = cache[old_real]["fake"]
+                old_fake = cache[old_real][0]
                 self.resolver.enqueue_nft(
                     ("del", "v6" if is_v6 else "v4", old_fake, old_real)
                 )
@@ -299,12 +293,7 @@ class IPManager:
                 pool.append(old_fake)
             fake_ip = pool.popleft()
             now = time.time()
-            cache[real_ip] = {
-                "fake": fake_ip,
-                "last": now,
-                "kernel_update": now,
-                "redis_update": now,
-            }
+            cache[real_ip] = [fake_ip, now, now, now]
             f2r[fake_ip] = real_ip
             self.resolver.enqueue_nft(
                 ("add", "v6" if is_v6 else "v4", fake_ip, real_ip)
@@ -385,6 +374,7 @@ class IPManager:
                             if channel == "path:evict":
                                 if isinstance(data, str) and "|" in data:
                                     fake, ver = data.rsplit("|", 1)
+                                    log("CLUSTER", f"Evicting {fake} ({ver})", "DEBUG")
                                     async with self.resolver.lock:
                                         f2r = (
                                             self.f2r_v6 if ver == "v6" else self.f2r_v4
@@ -398,18 +388,20 @@ class IPManager:
                                         real = f2r.pop(fake, None)
                                         if real:
                                             cache.pop(real, None)
-                                            self.resolver.enqueue_nft(
-                                                ("del", ver, fake, real)
-                                            )
-                                        else:
-                                            self.resolver.enqueue_nft(
-                                                ("del", ver, fake, "unknown")
-                                            )
+                                        
+                                        self.resolver.enqueue_nft(
+                                            ("del", ver, fake, real or "unknown")
+                                        )
                             elif channel == "path:map_new":
                                 if isinstance(data, str) and "|" in data:
                                     parts = data.rsplit("|", 2)
                                     if len(parts) == 3:
                                         fake, real, ver = parts
+                                        log(
+                                            "CLUSTER",
+                                            f"New mapping: {fake} -> {real} ({ver})",
+                                            "DEBUG",
+                                        )
                                         async with self.resolver.lock:
                                             f2r = (
                                                 self.f2r_v6
@@ -426,26 +418,12 @@ class IPManager:
                                                 if old_real and old_real != real:
                                                     cache.pop(old_real, None)
                                                 now = time.time()
-                                                cache[real] = {
-                                                    "fake": fake,
-                                                    "last": now,
-                                                    "kernel_update": now,
-                                                    "redis_update": now,
-                                                }
+                                                cache[real] = [fake, now, now, now]
                                                 f2r[fake] = real
 
-                                            async with self.resolver.state_lock:
-                                                known_real = self.resolver.known_kernel_state.get(
-                                                    fake
-                                                )
-                                            if known_real != real:
-                                                if known_real:
-                                                    self.resolver.enqueue_nft(
-                                                        ("del", ver, fake, known_real)
-                                                    )
-                                                self.resolver.enqueue_nft(
-                                                    ("add", ver, fake, real)
-                                                )
+                                            self.resolver.enqueue_nft(
+                                                ("add", ver, fake, real)
+                                            )
                         else:
                             await asyncio.sleep(0.1)
             except Exception as e:
@@ -470,10 +448,15 @@ class IPManager:
                     if await self.r.exists(init_flag):
                         return
                     log("CLUSTER", f"Initializing Redis pool {key}...")
-                    await self.r.delete(key)
+
+                    tmp_key = f"{key}:init_tmp"
+                    await self.r.delete(tmp_key)
+
                     chunk_size = 5000
                     for i in range(0, len(pool), chunk_size):
-                        await self.r.rpush(key, *pool[i : i + chunk_size])
+                        await self.r.rpush(tmp_key, *pool[i : i + chunk_size])
+
+                    await self.r.rename(tmp_key, key)
                     await self.r.set(init_flag, "1")
                 finally:
                     await self.r.delete(lock_key)
@@ -483,7 +466,7 @@ class IPManager:
         except Exception as e:
             log("CLUSTER", f"Pool initialization failed: {e}", "ERROR")
 
-    async def expire_redis_entries(self, ver):
+    async def expire_redis_entries(self, ver, limit):
         if not self.is_cluster:
             return
 
@@ -494,7 +477,7 @@ class IPManager:
         lua_expire = """
         local exp_key, map_key, rev_key, pool_key = KEYS[1], KEYS[2], KEYS[3], KEYS[4]
         local min_score, max_score, ver = ARGV[1], ARGV[2], ARGV[3]
-        local expired = redis.call('ZRANGEBYSCORE', exp_key, min_score, max_score, 'LIMIT', 0, 1000)
+        local expired = redis.call('ZRANGEBYSCORE', exp_key, min_score, max_score, 'LIMIT', 0, 5000)
         for _, fake in ipairs(expired) do
             local real = redis.call('HGET', rev_key, fake)
             redis.call('ZREM', exp_key, fake)
@@ -507,19 +490,26 @@ class IPManager:
         """
         try:
             max_score = time.time() - CLEANUP_EXPIRY
-            count = await self.r.eval(
-                lua_expire,
-                4,
-                f"path:exp:{ver}",
-                f"path:map:{ver}",
-                f"path:rev:{ver}",
-                f"path:pool:{ver}",
-                0,
-                max_score,
-                ver,
-            )
-            if count > 0:
-                log("CLUSTER", f"Expired {count} stale mappings for {ver}")
+            total_expired = 0
+            while total_expired < limit:
+                count = await self.r.eval(
+                    lua_expire,
+                    4,
+                    f"path:exp:{ver}",
+                    f"path:map:{ver}",
+                    f"path:rev:{ver}",
+                    f"path:pool:{ver}",
+                    0,
+                    max_score,
+                    ver,
+                )
+                if count <= 0:
+                    break
+                total_expired += count
+                await asyncio.sleep(0.01)
+
+            if total_expired > 0:
+                log("CLUSTER", f"Expired {total_expired} stale mappings for {ver}")
         except Exception as e:
             log("CLUSTER", f"Redis expiry failed: {e}", "ERROR")
 
@@ -541,9 +531,11 @@ class PathProxyResolver:
         self.udp_transport = None
 
         self.net_v4 = IPv4Network(ip_range_v4)
-        self.v4_count = min(self.net_v4.num_addresses - 2, 131070)
+        self.v4_count = self.net_v4.num_addresses - 2
         self.net_v6 = IPv6Network(ip_range_v6) if self.enable_ipv6 else None
-        self.v6_count = 65535 if self.enable_ipv6 else 0
+        self.v6_count = (self.net_v6.num_addresses - 2) if self.net_v6 else 0
+
+        self.l1_limit = max(100000, min(self.v4_count + self.v6_count, 1000000))
 
         self._all_ips_v4 = [
             str(addr) for i, addr in enumerate(self.net_v4.hosts()) if i < self.v4_count
@@ -587,7 +579,13 @@ class PathProxyResolver:
         while self.running:
             try:
                 if self.ip_manager.is_cluster and self.ip_manager.r:
-                    if self.role != "worker":
+                    is_master = self.role != "worker"
+                    if not is_master:
+                        lock_val = await self.ip_manager.r.get("path:master_lock")
+                        if lock_val:
+                            is_master = True
+
+                    if is_master:
                         await self.ip_manager.r.set(
                             "path:last_heartbeat", int(time.time())
                         )
@@ -707,10 +705,9 @@ class PathProxyResolver:
                                 f"add element inet path {ver}_map {{ {fake} : {real} }}"
                             )
                         else:
-                            if in_kernel:
-                                cmds.append(
-                                    f"delete element inet path {ver}_map {{ {fake} }}"
-                                )
+                            cmds.append(
+                                f"delete element inet path {ver}_map {{ {fake} }}"
+                            )
                 if cmds:
                     await self.run_nft(cmds)
                 for _ in items:
@@ -737,6 +734,10 @@ class PathProxyResolver:
                 for rr in getattr(res_dns, section):
                     if rr.rtype in (QTYPE.A, QTYPE.AAAA):
                         real_ip = str(rr.rdata)
+                        if real_ip in ("0.0.0.0", "::"):
+                            new_records.append(rr)
+                            continue
+
                         fake_ip = await self.ip_manager.get_fake_ip(
                             real_ip, rr.rtype == QTYPE.AAAA
                         )
@@ -792,9 +793,9 @@ class PathProxyResolver:
             mgr = self.ip_manager
             now = time.time()
             if mgr.is_cluster:
-                await mgr.expire_redis_entries("v4")
+                await mgr.expire_redis_entries("v4", self.v4_count)
                 if self.enable_ipv6:
-                    await mgr.expire_redis_entries("v6")
+                    await mgr.expire_redis_entries("v6", self.v6_count)
 
                 if now - self.last_full_recover > 3600:
                     await self.recover(silent=True)
@@ -808,10 +809,10 @@ class PathProxyResolver:
                         (self.ip_pool_v6 if ver == "v6" else self.ip_pool_v4),
                     )
                     to_del = [
-                        r for r, d in cache.items() if now - d["last"] > CLEANUP_EXPIRY
+                        r for r, d in cache.items() if now - d[1] > CLEANUP_EXPIRY
                     ]
                     for r in to_del:
-                        fake = cache[r]["fake"]
+                        fake = cache[r][0]
                         self.enqueue_nft(("del", ver, fake, r))
                         del cache[r]
                         del f2r[fake]
@@ -885,24 +886,14 @@ class PathProxyResolver:
                     for fake, real in actual_nft_v4.items():
                         now = time.time()
                         mgr.l1_cache_v4[real], mgr.f2r_v4[fake] = (
-                            {
-                                "fake": fake,
-                                "last": now,
-                                "kernel_update": now,
-                                "redis_update": now,
-                            },
+                            [fake, now, now, now],
                             real,
                         )
                         self.known_kernel_state[fake] = real
                     for fake, real in actual_nft_v6.items():
                         now = time.time()
                         mgr.l1_cache_v6[real], mgr.f2r_v6[fake] = (
-                            {
-                                "fake": fake,
-                                "last": now,
-                                "kernel_update": now,
-                                "redis_update": now,
-                            },
+                            [fake, now, now, now],
                             real,
                         )
                         self.known_kernel_state[fake] = real
@@ -925,12 +916,7 @@ class PathProxyResolver:
                             now = time.time()
                             f2r[fake], cache[real] = (
                                 real,
-                                {
-                                    "fake": fake,
-                                    "last": now,
-                                    "kernel_update": now,
-                                    "redis_update": now,
-                                },
+                                [fake, now, now, now],
                             )
                             needs_add = True
                             if fake in nft_cur:
@@ -941,13 +927,12 @@ class PathProxyResolver:
                                 except Exception:
                                     pass
                             if needs_add:
+                                actual_dels.append(
+                                    f"delete element inet path {ver}_map {{ {fake} }}"
+                                )
                                 actual_adds.append(
                                     f"add element inet path {ver}_map {{ {fake} : {real} }}"
                                 )
-                                if fake in nft_cur:
-                                    actual_dels.append(
-                                        f"delete element inet path {ver}_map {{ {fake} }}"
-                                    )
                         for fake, real in nft_cur.items():
                             if fake not in f2r:
                                 actual_dels.append(
