@@ -5,7 +5,6 @@ import socket
 import time
 import argparse
 import os
-import random
 import traceback
 import json
 from ipaddress import ip_address, IPv4Network, IPv6Network
@@ -81,6 +80,13 @@ class IPManager:
                         self.resolver.create_bg_task(
                             self.redis_touch_worker(), "redis_touch_worker"
                         )
+                    if not any(
+                        t.get_name() == "traffic_touch_worker"
+                        for t in self.resolver.bg_tasks
+                    ):
+                        self.resolver.create_bg_task(
+                            self.traffic_touch_worker(), "traffic_touch_worker"
+                        )
             except Exception as e:
                 if self.is_cluster:
                     log("CLUSTER", f"Redis connection lost: {e}", "WARNING")
@@ -93,33 +99,39 @@ class IPManager:
             f2r = self.f2r_v6 if is_v6 else self.f2r_v4
             if real_ip in cache:
                 data = cache[real_ip]
-                fake = data["fake"]
-                cache.move_to_end(real_ip)
                 now = time.time()
-                data["last"] = now
-                needs_kernel_refresh = now - data.get("kernel_update", 0) > 5400
-                needs_redis_refresh = self.is_cluster and (
-                    now - data.get("redis_update", 0) > 1800
-                )
 
-                async with self.resolver.state_lock:
-                    known_real = self.resolver.known_kernel_state.get(fake)
+                if now - data.get("last", 0) > 7200:
+                    fake = data["fake"]
+                    cache.pop(real_ip, None)
+                    f2r.pop(fake, None)
+                else:
+                    fake = data["fake"]
+                    cache.move_to_end(real_ip)
+                    data["last"] = now
+                    needs_kernel_refresh = now - data.get("kernel_update", 0) > 5400
+                    needs_redis_refresh = self.is_cluster and (
+                        now - data.get("redis_update", 0) > 1800
+                    )
 
-                ver = "v6" if is_v6 else "v4"
-                if known_real != real_ip:
-                    if known_real:
-                        self.resolver.enqueue_nft(("del", ver, fake, known_real))
-                    self.resolver.enqueue_nft(("add", ver, fake, real_ip))
-                    data["kernel_update"] = now
-                elif needs_kernel_refresh:
-                    self.resolver.enqueue_nft(("del", ver, fake, real_ip))
-                    self.resolver.enqueue_nft(("add", ver, fake, real_ip))
-                    data["kernel_update"] = now
+                    async with self.resolver.state_lock:
+                        known_real = self.resolver.known_kernel_state.get(fake)
 
-                if needs_redis_refresh:
-                    self.redis_touch_queue.add((fake, ver))
-                    data["redis_update"] = now
-                return fake
+                    ver = "v6" if is_v6 else "v4"
+                    if known_real != real_ip:
+                        if known_real:
+                            self.resolver.enqueue_nft(("del", ver, fake, known_real))
+                        self.resolver.enqueue_nft(("add", ver, fake, real_ip))
+                        data["kernel_update"] = now
+                    elif needs_kernel_refresh:
+                        self.resolver.enqueue_nft(("del", ver, fake, real_ip))
+                        self.resolver.enqueue_nft(("add", ver, fake, real_ip))
+                        data["kernel_update"] = now
+
+                    if needs_redis_refresh:
+                        self.redis_touch_queue.add((fake, ver))
+                        data["redis_update"] = now
+                    return fake
 
             if real_ip in self._inflight:
                 event = self._inflight[real_ip]
@@ -203,6 +215,67 @@ class IPManager:
                         await pipe.execute()
             except Exception as e:
                 log("CLUSTER", f"Touch worker error: {e}", "WARNING")
+
+    async def traffic_touch_worker(self):
+        while self.resolver.running:
+            try:
+                await asyncio.sleep(300)
+                if not self.is_cluster or not self.r:
+                    continue
+
+                proc = await asyncio.create_subprocess_shell(
+                    "nft -j list table inet path",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await proc.communicate()
+                if proc.returncode != 0:
+                    continue
+
+                def parse_traffic_json(json_data):
+                    v4, v6 = set(), set()
+                    data = json.loads(json_data.decode())
+                    for entry in data.get("nftables", []):
+                        if "map" in entry:
+                            m = entry["map"]
+                            if m.get("table") == "path" and m.get("name") in [
+                                "v4_map",
+                                "v6_map",
+                            ]:
+                                ver = "v4" if m["name"] == "v4_map" else "v6"
+                                dest = v4 if ver == "v4" else v6
+                                for elem in m.get("elem", []):
+                                    try:
+                                        f = (
+                                            elem[0]["elem"]["val"]
+                                            if isinstance(elem[0], dict)
+                                            else elem[0]
+                                        )
+                                        dest.add(str(f))
+                                    except Exception:
+                                        continue
+                    return v4, v6
+
+                found_v4, found_v6 = await asyncio.to_thread(parse_traffic_json, stdout)
+
+                if found_v4 or found_v6:
+                    now = time.time()
+                    chunk_size = 5000
+                    all_targets = [(f, "v4") for f in found_v4] + [
+                        (f, "v6") for f in found_v6
+                    ]
+                    for i in range(0, len(all_targets), chunk_size):
+                        async with self.r.pipeline() as pipe:
+                            for f, ver in all_targets[i : i + chunk_size]:
+                                pipe.zadd(f"path:exp:{ver}", {f: now})
+                            await pipe.execute()
+                    log(
+                        "CLUSTER",
+                        f"Traffic touch: {len(found_v4)} v4, {len(found_v6)} v6",
+                        "DEBUG",
+                    )
+            except Exception as e:
+                log("CLUSTER", f"Traffic touch error: {e}", "WARNING")
 
     async def _get_fake_local(self, real_ip, is_v6=False):
         async with self.resolver.lock:
@@ -295,7 +368,7 @@ class IPManager:
         while True:
             try:
                 async with self.r.pubsub() as pubsub:
-                    await pubsub.subscribe("path:sync", "path:evict", "path:map_new")
+                    await pubsub.subscribe("path:evict", "path:map_new")
                     log("CLUSTER", "Listening for cluster sync signals...")
                     while True:
                         msg = await pubsub.get_message(
@@ -308,23 +381,30 @@ class IPManager:
                                 channel = channel.decode()
                             if isinstance(data, bytes):
                                 data = data.decode()
-                            
-                            if channel == "path:sync":
-                                await asyncio.sleep(random.uniform(0.5, 5.0))
-                                await self.resolver.recover(silent=True)
-                            elif channel == "path:evict":
+
+                            if channel == "path:evict":
                                 if isinstance(data, str) and "|" in data:
                                     fake, ver = data.rsplit("|", 1)
                                     async with self.resolver.lock:
-                                        f2r = self.f2r_v6 if ver == "v6" else self.f2r_v4
-                                        cache = self.l1_cache_v6 if ver == "v6" else self.l1_cache_v4
-                                        
+                                        f2r = (
+                                            self.f2r_v6 if ver == "v6" else self.f2r_v4
+                                        )
+                                        cache = (
+                                            self.l1_cache_v6
+                                            if ver == "v6"
+                                            else self.l1_cache_v4
+                                        )
+
                                         real = f2r.pop(fake, None)
                                         if real:
                                             cache.pop(real, None)
-                                            self.resolver.enqueue_nft(("del", ver, fake, real))
+                                            self.resolver.enqueue_nft(
+                                                ("del", ver, fake, real)
+                                            )
                                         else:
-                                            self.resolver.enqueue_nft(("del", ver, fake, "unknown"))
+                                            self.resolver.enqueue_nft(
+                                                ("del", ver, fake, "unknown")
+                                            )
                             elif channel == "path:map_new":
                                 if isinstance(data, str) and "|" in data:
                                     parts = data.rsplit("|", 2)
@@ -346,15 +426,26 @@ class IPManager:
                                                 if old_real and old_real != real:
                                                     cache.pop(old_real, None)
                                                 now = time.time()
-                                                cache[real] = {"fake": fake, "last": now, "kernel_update": now, "redis_update": now}
+                                                cache[real] = {
+                                                    "fake": fake,
+                                                    "last": now,
+                                                    "kernel_update": now,
+                                                    "redis_update": now,
+                                                }
                                                 f2r[fake] = real
-                                            
+
                                             async with self.resolver.state_lock:
-                                                known_real = self.resolver.known_kernel_state.get(fake)
+                                                known_real = self.resolver.known_kernel_state.get(
+                                                    fake
+                                                )
                                             if known_real != real:
                                                 if known_real:
-                                                    self.resolver.enqueue_nft(("del", ver, fake, known_real))
-                                                self.resolver.enqueue_nft(("add", ver, fake, real))
+                                                    self.resolver.enqueue_nft(
+                                                        ("del", ver, fake, known_real)
+                                                    )
+                                                self.resolver.enqueue_nft(
+                                                    ("add", ver, fake, real)
+                                                )
                         else:
                             await asyncio.sleep(0.1)
             except Exception as e:
@@ -379,7 +470,8 @@ class IPManager:
                     if await self.r.exists(init_flag):
                         return
                     log("CLUSTER", f"Initializing Redis pool {key}...")
-                    chunk_size = 1000
+                    await self.r.delete(key)
+                    chunk_size = 5000
                     for i in range(0, len(pool), chunk_size):
                         await self.r.rpush(key, *pool[i : i + chunk_size])
                     await self.r.set(init_flag, "1")
@@ -394,6 +486,11 @@ class IPManager:
     async def expire_redis_entries(self, ver):
         if not self.is_cluster:
             return
+
+        lock_key = f"path:cleanup_lock:{ver}"
+        if not await self.r.set(lock_key, "1", nx=True, ex=60):
+            return
+
         lua_expire = """
         local exp_key, map_key, rev_key, pool_key = KEYS[1], KEYS[2], KEYS[3], KEYS[4]
         local min_score, max_score, ver = ARGV[1], ARGV[2], ARGV[3]
@@ -436,19 +533,31 @@ class PathProxyResolver:
         ip_range_v4="198.18.0.0/15",
         ip_range_v6="fd00:18::/111",
         redis_url=None,
+        role="solo",
     ):
         self.upstream_ip, self.upstream_port = upstream_ip, upstream_port
         self.enable_ipv6 = enable_ipv6
+        self.role = role.lower()
         self.udp_transport = None
-        
+
         self.net_v4 = IPv4Network(ip_range_v4)
         self.v4_count = min(self.net_v4.num_addresses - 2, 131070)
         self.net_v6 = IPv6Network(ip_range_v6) if self.enable_ipv6 else None
         self.v6_count = 65535 if self.enable_ipv6 else 0
-        
-        self._all_ips_v4 = [str(addr) for i, addr in enumerate(self.net_v4.hosts()) if i < self.v4_count]
-        self._all_ips_v6 = [str(addr) for i, addr in enumerate(self.net_v6.hosts()) if i < self.v6_count] if self.net_v6 else []
-        
+
+        self._all_ips_v4 = [
+            str(addr) for i, addr in enumerate(self.net_v4.hosts()) if i < self.v4_count
+        ]
+        self._all_ips_v6 = (
+            [
+                str(addr)
+                for i, addr in enumerate(self.net_v6.hosts())
+                if i < self.v6_count
+            ]
+            if self.net_v6
+            else []
+        )
+
         self.ip_pool_v4 = deque(self._all_ips_v4)
         self.ip_pool_v6 = deque(self._all_ips_v6)
         self.nft_queue = asyncio.Queue(maxsize=50000)
@@ -461,6 +570,7 @@ class PathProxyResolver:
         self.sem = asyncio.Semaphore(1000)
         self.bg_tasks = set()
         self._recover_scheduled = False
+        self.last_full_recover = time.time()
 
     def _task_done(self, t):
         self.bg_tasks.discard(t)
@@ -472,6 +582,18 @@ class PathProxyResolver:
         self.bg_tasks.add(t)
         t.add_done_callback(self._task_done)
         return t
+
+    async def heartbeat(self):
+        while self.running:
+            try:
+                if self.ip_manager.is_cluster and self.ip_manager.r:
+                    if self.role != "worker":
+                        await self.ip_manager.r.set(
+                            "path:last_heartbeat", int(time.time())
+                        )
+            except Exception:
+                pass
+            await asyncio.sleep(60)
 
     async def _recover_from_overflow(self):
         try:
@@ -489,10 +611,12 @@ class PathProxyResolver:
                 self._recover_scheduled = True
                 try:
                     asyncio.get_running_loop()
-                    self.create_bg_task(self._recover_from_overflow(), "recover_overflow")
+                    self.create_bg_task(
+                        self._recover_from_overflow(), "recover_overflow"
+                    )
                 except RuntimeError:
                     self._recover_scheduled = False
-    
+
     async def run_nft(self, lines):
         if not lines:
             return
@@ -510,11 +634,13 @@ class PathProxyResolver:
                 )
                 _, stderr = await proc.communicate(input=cmd.encode())
                 err = stderr.decode().strip()
-                
+
                 is_missing_del = "delete" in batch[0] and "No such file" in err
                 is_existing_add = "add" in batch[0] and "File exists" in err
-                
-                if proc.returncode == 0 or (len(batch) == 1 and (is_missing_del or is_existing_add)):
+
+                if proc.returncode == 0 or (
+                    len(batch) == 1 and (is_missing_del or is_existing_add)
+                ):
                     async with self.state_lock:
                         for line in batch:
                             try:
@@ -539,13 +665,21 @@ class PathProxyResolver:
             log("NFTABLES", f"Batch applied ({len(lines)} commands)", lvl)
         else:
             if "No such file" not in err and "File exists" not in err:
-                log("NFTABLES", f"Batch failed ({len(lines)} commands): {err}", "WARNING")
-            
+                log(
+                    "NFTABLES",
+                    f"Batch failed ({len(lines)} commands): {err}",
+                    "WARNING",
+                )
+
             for line in lines:
                 ok_ind, err_ind = await _execute([line])
                 if not ok_ind:
                     if "No such file" not in err_ind and "File exists" not in err_ind:
-                        log("NFTABLES", f"Command failed: {line.strip()} -> {err_ind}", "ERROR")
+                        log(
+                            "NFTABLES",
+                            f"Command failed: {line.strip()} -> {err_ind}",
+                            "ERROR",
+                        )
 
     async def nft_worker(self):
         log("NFTABLES", "NFTables synchronizer started")
@@ -570,7 +704,7 @@ class PathProxyResolver:
                                     f"delete element inet path {ver}_map {{ {fake} }}"
                                 )
                             cmds.append(
-                                f"add element inet path {ver}_map {{ {fake} timeout 2h : {real} }}"
+                                f"add element inet path {ver}_map {{ {fake} : {real} }}"
                             )
                         else:
                             if in_kernel:
@@ -656,10 +790,15 @@ class PathProxyResolver:
         while self.running:
             await asyncio.sleep(CLEANUP_INTERVAL)
             mgr = self.ip_manager
+            now = time.time()
             if mgr.is_cluster:
                 await mgr.expire_redis_entries("v4")
                 if self.enable_ipv6:
                     await mgr.expire_redis_entries("v6")
+
+                if now - self.last_full_recover > 3600:
+                    await self.recover(silent=True)
+                    self.last_full_recover = now
                 continue
             async with self.lock:
                 now = time.time()
@@ -691,28 +830,36 @@ class PathProxyResolver:
             )
             out, _ = await proc.communicate()
             if proc.returncode == 0:
-                data = json.loads(out.decode())
-                for entry in data.get("nftables", []):
-                    if "map" in entry:
-                        m = entry["map"]
-                        if m.get("table") == "path" and m.get("name") in [
-                            "v4_map",
-                            "v6_map",
-                        ]:
-                            ver = "v4" if m["name"] == "v4_map" else "v6"
-                            dest = actual_nft_v4 if ver == "v4" else actual_nft_v6
-                            for elem in m.get("elem", []):
-                                try:
-                                    raw_f = elem[0]
-                                    f = (
-                                        raw_f["elem"]["val"]
-                                        if isinstance(raw_f, dict)
-                                        else raw_f
-                                    )
-                                    r = elem[1]
-                                    dest[str(f)] = str(r)
-                                except (IndexError, KeyError, TypeError):
-                                    continue
+
+                def parse_nft_json(json_data):
+                    v4, v6 = {}, {}
+                    data = json.loads(json_data.decode())
+                    for entry in data.get("nftables", []):
+                        if "map" in entry:
+                            m = entry["map"]
+                            if m.get("table") == "path" and m.get("name") in [
+                                "v4_map",
+                                "v6_map",
+                            ]:
+                                ver = "v4" if m["name"] == "v4_map" else "v6"
+                                dest = v4 if ver == "v4" else v6
+                                for elem in m.get("elem", []):
+                                    try:
+                                        raw_f = elem[0]
+                                        f = (
+                                            raw_f["elem"]["val"]
+                                            if isinstance(raw_f, dict)
+                                            else raw_f
+                                        )
+                                        r = elem[1]
+                                        dest[str(f)] = str(r)
+                                    except (IndexError, KeyError, TypeError):
+                                        continue
+                    return v4, v6
+
+                actual_nft_v4, actual_nft_v6 = await asyncio.to_thread(
+                    parse_nft_json, out
+                )
         except Exception as e:
             log("RECOVERY", f"NFT JSON parse failed: {e}", "WARNING")
 
@@ -795,7 +942,7 @@ class PathProxyResolver:
                                     pass
                             if needs_add:
                                 actual_adds.append(
-                                    f"add element inet path {ver}_map {{ {fake} timeout 2h : {real} }}"
+                                    f"add element inet path {ver}_map {{ {fake} : {real} }}"
                                 )
                                 if fake in nft_cur:
                                     actual_dels.append(
@@ -808,12 +955,14 @@ class PathProxyResolver:
                                 )
                         all_nft_cmds.extend(actual_dels)
                         all_nft_cmds.extend(actual_adds)
-            
+
             occ_v4, occ_v6 = set(mgr.f2r_v4.keys()), set(mgr.f2r_v6.keys())
             self.ip_pool_v4 = deque([ip for ip in self._all_ips_v4 if ip not in occ_v4])
             if self.net_v6:
-                self.ip_pool_v6 = deque([ip for ip in self._all_ips_v6 if ip not in occ_v6])
-        
+                self.ip_pool_v6 = deque(
+                    [ip for ip in self._all_ips_v6 if ip not in occ_v6]
+                )
+
         if all_nft_cmds:
             await self.run_nft(all_nft_cmds)
 
@@ -912,6 +1061,7 @@ async def main():
         redis_url=os.getenv("REDIS_URL"),
         ip_range_v4=f"{f4}.0.0/{m4}",
         ip_range_v6=f"{f6}/{m6}",
+        role=os.getenv("NODE_ROLE", "solo"),
     )
 
     def stop():
@@ -938,6 +1088,7 @@ async def main():
                     "WARNING",
                 )
         resolver.create_bg_task(resolver.nft_worker(), "nft_worker")
+        resolver.create_bg_task(resolver.heartbeat(), "heartbeat")
         await resolver.recover(silent=False)
         resolver.create_bg_task(
             resolver.ip_manager.check_connection(), "check_connection"
@@ -952,6 +1103,9 @@ async def main():
             )
             resolver.create_bg_task(
                 resolver.ip_manager.redis_touch_worker(), "redis_touch_worker"
+            )
+            resolver.create_bg_task(
+                resolver.ip_manager.traffic_touch_worker(), "traffic_touch_worker"
             )
         await resolver.serve(args.address, args.port)
     except asyncio.CancelledError:

@@ -69,8 +69,8 @@ async def main():
                                     log("Sync signal received, triggering processing")
                                     proc = await asyncio.create_subprocess_exec(
                                         str(process_script),
-                                        stdout=asyncio.subprocess.DEVNULL,
-                                        stderr=asyncio.subprocess.DEVNULL,
+                                        stdout=None,
+                                        stderr=None,
                                     )
                                     await proc.wait()
                                     if proc.returncode == 0:
@@ -100,8 +100,8 @@ async def main():
                                             )
                                             proc = await asyncio.create_subprocess_exec(
                                                 str(process_script),
-                                                stdout=asyncio.subprocess.DEVNULL,
-                                                stderr=asyncio.subprocess.DEVNULL,
+                                                stdout=None,
+                                                stderr=None,
                                             )
                                             await proc.wait()
                                             if proc.returncode == 0:

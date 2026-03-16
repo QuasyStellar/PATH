@@ -18,8 +18,8 @@ cleanup_tmp() {
 trap cleanup_tmp EXIT
 cat <<EOF > "$NFT_TMP"
 table inet path {
-    map v4_map { type ipv4_addr : ipv4_addr; flags timeout; }
-    $( [[ "$ENABLE_IPV6" == "y" ]] && echo "map v6_map { type ipv6_addr : ipv6_addr; flags timeout; }" )
+    map v4_map { type ipv4_addr : ipv4_addr; }
+    $( [[ "$ENABLE_IPV6" == "y" ]] && echo "map v6_map { type ipv6_addr : ipv6_addr; }" )
     chain input {
         type filter hook input priority 0; policy accept;
         iifname "lo" accept

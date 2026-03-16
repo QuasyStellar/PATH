@@ -466,9 +466,17 @@ class Processor:
             if src.exists():
                 if not dst.exists() or not filecmp.cmp(src, dst, shallow=False):
                     tmp_dst = dst.with_suffix(".tmp")
-                    shutil.copy2(src, tmp_dst)
-                    tmp_dst.rename(dst)
-                    changed = True
+                    try:
+                        shutil.copy2(src, tmp_dst)
+                        os.chmod(tmp_dst, 0o644)
+                        tmp_dst.rename(dst)
+                        changed = True
+                    except Exception as e:
+                        log(
+                            "SYNC",
+                            f"Failed to atomic copy {src} to {dst}: {e}",
+                            "ERROR",
+                        )
         if changed:
             ctrl_dir = "/run/knot-resolver/control"
             if os.path.exists(ctrl_dir):
@@ -482,13 +490,32 @@ class Processor:
                             timeout=5,
                         )
                     except subprocess.TimeoutExpired:
-                        log("SYNC", f"Knot cache clear timed out on {s_name}", "WARNING")
+                        log(
+                            "SYNC", f"Knot cache clear timed out on {s_name}", "WARNING"
+                        )
                     except Exception as e:
-                        log("SYNC", f"Failed to clear Knot cache on {s_name}: {e}", "WARNING")
+                        log(
+                            "SYNC",
+                            f"Failed to clear Knot cache on {s_name}: {e}",
+                            "WARNING",
+                        )
 
     def _sync_to_redis_blocking(self, h):
         if not self.r:
             return False
+
+        try:
+            current_master = self.r.get("path:master_lock")
+            if current_master and int(current_master) != os.getpid():
+                log(
+                    "REDIS",
+                    f"Conflict: Another node (PID {current_master.decode() if isinstance(current_master, bytes) else current_master}) is now Master. Aborting sync.",
+                    "WARNING",
+                )
+                return False
+        except Exception as e:
+            log("REDIS", f"Master lock check failed: {e}", "WARNING")
+
         log("REDIS", "Pushing results to cluster storage...")
         try:
             pipe = self.r.pipeline()
@@ -590,7 +617,11 @@ class Processor:
                                     content = zlib.decompress(data)
                                 else:
                                     content = zlib.decompress(bytes(data))
-                                (dir_path / fname).write_bytes(content)
+
+                                target = dir_path / fname
+                                tmp_target = target.with_suffix(".tmp")
+                                tmp_target.write_bytes(content)
+                                tmp_target.rename(target)
                             except Exception:
                                 all_ok = False
                         for f in dir_path.glob("*.txt"):
@@ -610,7 +641,10 @@ class Processor:
                 data = self.r.get(f"path:data:{f}")
                 if data:
                     try:
-                        (RESULT_DIR / f).write_bytes(zlib.decompress(data))
+                        target = RESULT_DIR / f
+                        tmp_target = target.with_suffix(".tmp")
+                        tmp_target.write_bytes(zlib.decompress(data))
+                        tmp_target.rename(target)
                     except Exception:
                         all_ok = False
                 else:
@@ -769,13 +803,27 @@ class Processor:
             cas_total = c1 + c2 + c3
 
             ex_common = {d for d, ex in ex_global}
-            ex_proxy = ex_common | {d for d, ex in ex_proxy_only} | {d for d, ex in hosts_proxy_raw if ex}
-            ex_ad = ex_common | {d for d, ex in ex_ad_only} | {d for d, ex in hosts_ad_raw if ex}
+            ex_proxy = (
+                ex_common
+                | {d for d, ex in ex_proxy_only}
+                | {d for d, ex in hosts_proxy_raw if ex}
+            )
+            ex_ad = (
+                ex_common
+                | {d for d, ex in ex_ad_only}
+                | {d for d, ex in hosts_ad_raw if ex}
+            )
             ex_deny2 = ex_common | {d for d, ex in hosts_deny2_raw if ex}
 
-            proxy_domains = optimize_trie({d for d, ex in hosts_proxy_raw if not ex} - ex_proxy)
-            adblock_domains = optimize_trie({d for d, ex in hosts_ad_raw if not ex} - ex_ad)
-            deny2_domains = optimize_trie({d for d, ex in hosts_deny2_raw if not ex} - ex_deny2)
+            proxy_domains = optimize_trie(
+                {d for d, ex in hosts_proxy_raw if not ex} - ex_proxy
+            )
+            adblock_domains = optimize_trie(
+                {d for d, ex in hosts_ad_raw if not ex} - ex_ad
+            )
+            deny2_domains = optimize_trie(
+                {d for d, ex in hosts_deny2_raw if not ex} - ex_deny2
+            )
 
             if self.env.get("ROUTE_ALL") == "y":
                 proxy_domains = ["."]
@@ -811,6 +859,7 @@ class Processor:
             log("ENGINE", "Status: SUCCESS")
         except Exception:
             log("ENGINE", f"CRITICAL CRASH: {traceback.format_exc()}", "ERROR")
+            sys.exit(1)
         finally:
             if self.r:
                 try:

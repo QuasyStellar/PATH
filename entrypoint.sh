@@ -51,6 +51,7 @@ if [[ "$DOH_ENABLE" == "y" ]]; then
     mkdir -p "$SSL_DIR"
     if [[ "$DOH_GENERATE_CERT" == "y" && -n "$DOH_DOMAIN" ]]; then
         if [ ! -f "/etc/letsencrypt/live/$DOH_DOMAIN/fullchain.pem" ]; then
+            log "Generating SSL certificate for $DOH_DOMAIN via Certbot..."
             certbot certonly --standalone -d "$DOH_DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email
         fi
         chmod -R 755 /etc/letsencrypt/archive/ /etc/letsencrypt/live/
@@ -64,6 +65,7 @@ if [[ "$DOH_ENABLE" == "y" ]]; then
         DOH_KEY="$SSL_DIR/server.key"
     elif [[ -z "$DOH_CERT" || -z "$DOH_KEY" ]]; then
         if [ ! -f "$SSL_DIR/server.crt" ]; then
+            log "Generating self-signed fallback certificate..."
             openssl req -x509 -newkey rsa:2048 -keyout "$SSL_DIR/server.key" -out "$SSL_DIR/server.crt" -days 3650 -nodes -subj "/CN=doh-selfsigned"
         fi
         DOH_CERT="$SSL_DIR/server.crt"
@@ -100,16 +102,19 @@ EOF
 chmod 600 /root/path/.env
 
 cleanup() {
+    echo -e "\n[$(date +'%H:%M:%S')] [INFO] SYSTEM | Container stopping, cleaning up..."
     /root/path/down.sh 2>/dev/null || true
     exit 0
 }
 trap cleanup SIGTERM SIGINT
 
+log "PATH initializing as ${NODE_ROLE^^}..."
 sysctl -p /etc/sysctl.d/99-path.conf || true
 
 if [[ "$NODE_ROLE" == "worker" ]]; then
     sed -i '/\[program:cron\]/,$d' /etc/supervisor/conf.d/supervisord.conf
     cat <<EOF >> /etc/supervisor/conf.d/supervisord.conf
+
 [program:sync-listener]
 command=/root/path/sync_listener.py
 autostart=true
@@ -121,11 +126,25 @@ stderr_logfile_maxbytes=0
 EOF
 fi
 
+log "Starting PATH Engine..."
 /root/path/process.py
+
+log "Applying network routing rules..."
 /root/path/up.sh
 
 if [[ "$NODE_ROLE" != "worker" ]]; then
     echo "0 3 * * * /root/path/process.py" | crontab -
+fi
+
+log "Starting PATH services via Supervisor..."
+
+DATA_COUNT=$(find /root/path/lists -name "*.txt" -exec grep -v '^#' {} + | grep -v '^[[:space:]]*$' | wc -l || echo 0)
+
+if [ "${DATA_COUNT:-0}" -eq 0 ]; then
+    echo -e "\n\e[1;33m[WARNING] YOUR PROXY LISTS ARE EMPTY!\e[0m"
+    echo -e "Add your sources to: \e[1;34m./lists/sources/\e[0m"
+    echo -e "Add custom domains to: \e[1;34m./lists/manual/\e[0m"
+    echo -e "Then run: \e[1;32mdocker exec path /root/path/process.py\e[0m\n"
 fi
 
 /usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.conf &
