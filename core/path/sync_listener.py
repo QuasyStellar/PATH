@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import sys
 import time
 import redis.asyncio as redis
 from pathlib import Path
@@ -74,16 +75,14 @@ async def main():
                         msg = await pubsub.get_message(
                             ignore_subscribe_messages=True, timeout=1.0
                         )
-                        if msg:
+                        if msg and role != "master":
                             data = msg["data"]
                             if isinstance(data, bytes):
                                 data = data.decode()
-
                             if data == "reload":
-                                if role != "master":
-                                    now = time.time()
-                                    if now - last_sync > 5:
-                                        await run_sync("Pub/Sub reload signal")
+                                now = time.time()
+                                if now - last_sync > 5:
+                                    await run_sync("Pub/Sub reload signal")
 
                         now = time.time()
                         if role != "master":
@@ -91,26 +90,46 @@ async def main():
                                 last_check = now
                                 try:
                                     remote_h = await r.get("path:hash")
+                                    last_hb_raw = await r.get("path:last_heartbeat")
+
+                                    should_sync = False
+                                    reason = ""
+
                                     if remote_h:
-                                        local_h = None
-                                        if hash_file.exists():
-                                            local_h = hash_file.read_text().strip()
                                         if isinstance(remote_h, bytes):
                                             remote_h = remote_h.decode()
-                                        if remote_h and remote_h != local_h:
-                                            if now - last_sync > 10:
-                                                await run_sync("Redis hash changed")
+                                        local_h = (
+                                            hash_file.read_text().strip()
+                                            if hash_file.exists()
+                                            else None
+                                        )
+                                        if remote_h != local_h:
+                                            should_sync = True
+                                            reason = "Redis hash changed"
+
+                                    if not should_sync and last_hb_raw:
+                                        last_hb = int(
+                                            last_hb_raw.decode()
+                                            if isinstance(last_hb_raw, bytes)
+                                            else last_hb_raw
+                                        )
+                                        if int(time.time()) - last_hb > 900:
+                                            should_sync = True
+                                            reason = "Master heartbeat timeout"
+
+                                    if should_sync and now - last_sync > 10:
+                                        await run_sync(reason)
                                 except Exception:
                                     pass
-
-                            if now - last_hb_check > 900:
-                                await run_sync("Scheduled heartbeat check")
 
                         await asyncio.sleep(0.1)
         except Exception as e:
             if not running:
                 break
             log(f"Connection lost: {e}. Retrying in {backoff}s...", "WARNING")
+            if backoff >= 60:
+                log("Critical connection failure, exiting for restart", "ERROR")
+                sys.exit(1)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 

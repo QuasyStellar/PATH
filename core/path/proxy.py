@@ -36,6 +36,7 @@ class IPManager:
         self.f2r_v6 = {}
         self._inflight = {}
         self.redis_touch_queue = set()
+        self.last_seq = None
 
         if redis_url:
             try:
@@ -62,7 +63,11 @@ class IPManager:
                 if not self.is_cluster:
                     log("CLUSTER", "Connected to Redis cluster storage")
                     self.is_cluster = True
+
                     await self.resolver.recover(silent=True)
+
+                    seq = await self.r.get("path:sequence")
+                    self.last_seq = int(seq) if seq else 0
                     await self.init_pool(
                         self.resolver._all_ips_v4, self.resolver._all_ips_v6
                     )
@@ -218,7 +223,7 @@ class IPManager:
                     continue
 
                 proc = await asyncio.create_subprocess_shell(
-                    "nft -j list table inet path",
+                    "nft -j list maps inet path",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
@@ -260,8 +265,13 @@ class IPManager:
                     ]
                     for i in range(0, len(all_targets), chunk_size):
                         async with self.r.pipeline() as pipe:
-                            for f, ver in all_targets[i : i + chunk_size]:
-                                pipe.zadd(f"path:exp:{ver}", {f: now})
+                            chunk = all_targets[i : i + chunk_size]
+                            v4_batch = {f: now for f, v in chunk if v == "v4"}
+                            v6_batch = {f: now for f, v in chunk if v == "v6"}
+                            if v4_batch:
+                                pipe.zadd("path:exp:v4", v4_batch)
+                            if v6_batch:
+                                pipe.zadd("path:exp:v6", v6_batch)
                             await pipe.execute()
                     log(
                         "CLUSTER",
@@ -308,6 +318,8 @@ class IPManager:
         local existing = redis.call('HGET', m_key, real_ip)
         if existing then
             redis.call('ZADD', e_key, now, existing)
+            local s = redis.call('INCR', 'path:sequence')
+            redis.call('PUBLISH', 'path:map_new', existing .. '|' .. real_ip .. '|' .. ver .. '|' .. s)
             return existing
         end
         local fake = redis.call('LPOP', p_key)
@@ -319,12 +331,14 @@ class IPManager:
             redis.call('ZREM', e_key, fake)
             if old_real then redis.call('HDEL', m_key, old_real) end
             redis.call('HDEL', r_key, fake)
-            redis.call('PUBLISH', 'path:evict', fake .. '|' .. ver)
+            local eseq = redis.call('INCR', 'path:sequence')
+            redis.call('PUBLISH', 'path:evict', fake .. '|' .. ver .. '|' .. eseq)
         end
         redis.call('HSET', m_key, real_ip, fake)
         redis.call('HSET', r_key, fake, real_ip)
         redis.call('ZADD', e_key, now, fake)
-        redis.call('PUBLISH', 'path:map_new', fake .. '|' .. real_ip .. '|' .. ver)
+        local seq = redis.call('INCR', 'path:sequence')
+        redis.call('PUBLISH', 'path:map_new', fake .. '|' .. real_ip .. '|' .. ver .. '|' .. seq)
         return fake
         """
         try:
@@ -373,7 +387,26 @@ class IPManager:
 
                             if channel == "path:evict":
                                 if isinstance(data, str) and "|" in data:
-                                    fake, ver = data.rsplit("|", 1)
+                                    parts = data.rsplit("|", 2)
+                                    fake, ver = parts[0], parts[1]
+                                    seq = int(parts[2]) if len(parts) == 3 else None
+
+                                    if (
+                                        seq
+                                        and self.last_seq is not None
+                                        and seq > self.last_seq + 1
+                                    ):
+                                        log(
+                                            "CLUSTER",
+                                            f"Sequence gap detected ({self.last_seq} -> {seq}), triggering recover",
+                                            "WARNING",
+                                        )
+                                        await self.resolver.recover(silent=True)
+                                    if seq and (
+                                        self.last_seq is None or seq > self.last_seq
+                                    ):
+                                        self.last_seq = seq
+
                                     log("CLUSTER", f"Evicting {fake} ({ver})", "DEBUG")
                                     async with self.resolver.lock:
                                         f2r = (
@@ -388,15 +421,33 @@ class IPManager:
                                         real = f2r.pop(fake, None)
                                         if real:
                                             cache.pop(real, None)
-                                        
+
                                         self.resolver.enqueue_nft(
                                             ("del", ver, fake, real or "unknown")
                                         )
                             elif channel == "path:map_new":
                                 if isinstance(data, str) and "|" in data:
-                                    parts = data.rsplit("|", 2)
-                                    if len(parts) == 3:
-                                        fake, real, ver = parts
+                                    parts = data.rsplit("|", 3)
+                                    if len(parts) >= 3:
+                                        fake, real, ver = parts[0], parts[1], parts[2]
+                                        seq = int(parts[3]) if len(parts) == 4 else None
+
+                                        if (
+                                            seq
+                                            and self.last_seq is not None
+                                            and seq > self.last_seq + 1
+                                        ):
+                                            log(
+                                                "CLUSTER",
+                                                f"Sequence gap detected ({self.last_seq} -> {seq}), triggering recover",
+                                                "WARNING",
+                                            )
+                                            await self.resolver.recover(silent=True)
+                                        if seq and (
+                                            self.last_seq is None or seq > self.last_seq
+                                        ):
+                                            self.last_seq = seq
+
                                         log(
                                             "CLUSTER",
                                             f"New mapping: {fake} -> {real} ({ver})",
@@ -484,7 +535,8 @@ class IPManager:
             redis.call('HDEL', rev_key, fake)
             if real then redis.call('HDEL', map_key, real) end
             redis.call('RPUSH', pool_key, fake)
-            redis.call('PUBLISH', 'path:evict', fake .. '|' .. ver)
+            local eseq = redis.call('INCR', 'path:sequence')
+            redis.call('PUBLISH', 'path:evict', fake .. '|' .. ver .. '|' .. eseq)
         end
         return #expired
         """
@@ -576,6 +628,7 @@ class PathProxyResolver:
         return t
 
     async def heartbeat(self):
+        my_id = socket.gethostname()
         while self.running:
             try:
                 if self.ip_manager.is_cluster and self.ip_manager.r:
@@ -583,7 +636,11 @@ class PathProxyResolver:
                     if not is_master:
                         lock_val = await self.ip_manager.r.get("path:master_lock")
                         if lock_val:
-                            is_master = True
+                            if isinstance(lock_val, bytes):
+                                lock_val = lock_val.decode()
+                            if lock_val == my_id:
+                                is_master = True
+                                await self.ip_manager.r.expire("path:master_lock", 3600)
 
                     if is_master:
                         await self.ip_manager.r.set(
@@ -630,7 +687,15 @@ class PathProxyResolver:
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                _, stderr = await proc.communicate(input=cmd.encode())
+                try:
+                    _, stderr = await proc.communicate(input=cmd.encode())
+                except Exception:
+                    if proc.returncode is None:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                    raise
                 err = stderr.decode().strip()
 
                 is_missing_del = "delete" in batch[0] and "No such file" in err
@@ -708,8 +773,10 @@ class PathProxyResolver:
                             cmds.append(
                                 f"delete element inet path {ver}_map {{ {fake} }}"
                             )
+
                 if cmds:
                     await self.run_nft(cmds)
+
                 for _ in items:
                     self.nft_queue.task_done()
             except Exception:
@@ -787,11 +854,12 @@ class PathProxyResolver:
         except Exception:
             return None
 
-    async def cleanup(self):
+    async def garbage_collector(self):
         while self.running:
             await asyncio.sleep(CLEANUP_INTERVAL)
             mgr = self.ip_manager
             now = time.time()
+
             if mgr.is_cluster:
                 await mgr.expire_redis_entries("v4", self.v4_count)
                 if self.enable_ipv6:
@@ -800,9 +868,8 @@ class PathProxyResolver:
                 if now - self.last_full_recover > 3600:
                     await self.recover(silent=True)
                     self.last_full_recover = now
-                continue
+
             async with self.lock:
-                now = time.time()
                 for ver, cache in [("v4", mgr.l1_cache_v4), ("v6", mgr.l1_cache_v6)]:
                     f2r, pool = (
                         (mgr.f2r_v6 if ver == "v6" else mgr.f2r_v4),
@@ -825,7 +892,7 @@ class PathProxyResolver:
         actual_nft_v4, actual_nft_v6 = {}, {}
         try:
             proc = await asyncio.create_subprocess_shell(
-                "nft -j list table inet path",
+                "nft -j list maps inet path",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -975,8 +1042,10 @@ class UDP(asyncio.DatagramProtocol):
         self.transport = transport
 
     def datagram_received(self, data, addr):
-        if not self.resolver.sem.locked():
-            self.resolver.create_bg_task(self.run(data, addr), f"udp_{addr}")
+        if self.resolver.sem.locked():
+            log("UDP", f"Queue full, dropping query from {addr[0]}", "WARNING")
+            return
+        self.resolver.create_bg_task(self.run(data, addr), f"udp_{addr}")
 
     async def run(self, data, addr):
         try:
@@ -995,6 +1064,7 @@ class TCP:
 
     async def handle(self, r, w):
         if self.sem.locked():
+            log("TCP", "Queue full, closing session", "WARNING")
             w.close()
             return
         async with self.sem:
@@ -1078,7 +1148,7 @@ async def main():
         resolver.create_bg_task(
             resolver.ip_manager.check_connection(), "check_connection"
         )
-        resolver.create_bg_task(resolver.cleanup(), "cleanup")
+        resolver.create_bg_task(resolver.garbage_collector(), "garbage_collector")
         if resolver.ip_manager.is_cluster:
             await resolver.ip_manager.init_pool(
                 list(resolver.ip_pool_v4), list(resolver.ip_pool_v6)

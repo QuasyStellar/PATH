@@ -7,8 +7,7 @@ if [[ -f ".env" ]]; then
     . ./.env
     set +a
 fi
-ip addr add "${IP:-10}.77.77.77/32" dev lo || true
-for i in 1 2; do echo "cache.clear()" | socat - unix-connect:/run/knot-resolver/control/$i 2>/dev/null || true; done
+ip addr add "${IP:-10}.77.77.77/32" dev lo 2>/dev/null || true
 M4="${FAKE_NETMASK_V4:-15}"; M6="${FAKE_NETMASK_V6:-111}"
 F4="${FAKE_IP:-198.18}"; F6="${FAKE_IP6:-fd00:18::}"
 NFT_TMP="$(mktemp /tmp/path.XXXXXX.nft)"

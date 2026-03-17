@@ -7,6 +7,7 @@ import hashlib
 import ipaddress
 import subprocess
 import asyncio
+import socket
 import aiohttp
 import zlib
 import re
@@ -38,7 +39,9 @@ LABEL_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$", re.I)
 def _normalize_domain_candidate(line):
     if not line:
         return None
-    line = line.strip().lower().strip(".")
+    line = line.strip().lower()
+    line = re.split(r"[]_~:/?#\[@!$&'()*+,;=]", line)[0]
+    line = line.strip(".")
     if not line:
         return None
     if not all(ord(c) < 128 for c in line):
@@ -61,11 +64,11 @@ def validate_domain(line):
     line = _normalize_domain_candidate(line)
     if not line:
         return None
-    labels = line.split(".")
-    if len(labels) < 2 or len(line) > 253:
+    if "." not in line or len(line) > 253:
         return None
+    labels = line.split(".")
     for label in labels:
-        if not LABEL_RE.match(label):
+        if not label or not LABEL_RE.match(label):
             return None
     return line
 
@@ -80,31 +83,28 @@ def parse_adblock_line(line):
     if "##" in line or "#@#" in line:
         return None
 
-    if line.startswith("||") or line.startswith("@@||"):
-        if "*" in line:
-            return None
-        if line.startswith("@@||"):
-            is_ex = True
-            line = line[4:]
-        elif line.startswith("||"):
-            is_ex = False
-            line = line[2:]
-        else:
-            return None
-        if "^" in line:
-            line = line.split("^", 1)[0]
-        line = line.split()[0]
+    if "*" in line:
+        return None
+
+    is_ex = False
+    domain = None
+
+    if line.startswith("@@||"):
+        is_ex = True
+        domain = line[4:].split("^")[0]
+    elif line.startswith("||"):
+        is_ex = False
+        domain = line[2:].split("^")[0]
     else:
         is_ex = line.startswith("@@")
         if is_ex:
             line = line[2:]
-        if line.startswith("||"):
-            line = line[2:]
-        line = re.split(r"[\^\$/\s#]", line)[0]
+        domain = re.split(r"[]_~:/?#\[@!$&'()*+,;=]", line)[0]
 
-    if not line:
+    if not domain:
         return None
-    v = validate_domain(line)
+    
+    v = validate_domain(domain)
     if not v:
         return None
     return (v, is_ex)
@@ -121,7 +121,7 @@ def validate_file(path, is_ip, f_cas):
                     line = line_bytes.decode("utf-8", errors="replace").strip()
                 except Exception:
                     continue
-                if not line or line.startswith("!") or line.startswith("["):
+                if not line or line[0] in "!#[]":
                     continue
 
                 if is_ip:
@@ -230,18 +230,6 @@ class Processor:
                 )
             except Exception:
                 pass
-        self.hb_task = None
-
-    async def heartbeat(self):
-        while True:
-            try:
-                if self.r:
-                    await asyncio.to_thread(
-                        self.r.set, "path:last_heartbeat", int(time.time())
-                    )
-            except Exception:
-                pass
-            await asyncio.sleep(60)
 
     def _r_exists(self, key):
         if not self.r:
@@ -520,15 +508,30 @@ class Processor:
         if not self.r:
             return False
 
+        role = self.env.get("NODE_ROLE", "solo").lower()
+        my_id = socket.gethostname()
+
         try:
             current_master = self.r.get("path:master_lock")
-            if current_master and int(current_master) != os.getpid():
-                log(
-                    "REDIS",
-                    f"Conflict: Another node (PID {current_master.decode() if isinstance(current_master, bytes) else current_master}) is now Master. Aborting sync.",
-                    "WARNING",
-                )
-                return False
+            if current_master:
+                if isinstance(current_master, bytes):
+                    current_master = current_master.decode()
+
+                if current_master != my_id:
+                    if role == "master":
+                        log(
+                            "REDIS",
+                            f"Reclaiming Master role from {current_master}...",
+                            "INFO",
+                        )
+                        self.r.set("path:master_lock", my_id, ex=3600)
+                    else:
+                        log(
+                            "REDIS",
+                            f"Conflict: Node {current_master} is now Master. Aborting sync.",
+                            "WARNING",
+                        )
+                        return False
         except Exception as e:
             log("REDIS", f"Master lock check failed: {e}", "WARNING")
 
@@ -606,10 +609,17 @@ class Processor:
         if not self.r:
             return False
         try:
-            log("REDIS", "Fetching data from cluster master...")
             remote_h = self.r.get("path:hash")
             if not remote_h:
                 return False
+            if isinstance(remote_h, bytes):
+                remote_h = remote_h.decode()
+
+            h_file = RESULT_DIR / ".hash"
+            if h_file.exists() and h_file.read_text().strip() == remote_h:
+                return "NO_CHANGE"
+
+            log("REDIS", "Fetching data from cluster master...")
             all_ok = True
             lists_ready = bool(self.r.get("path:lists:ready"))
             if lists_ready:
@@ -680,7 +690,10 @@ class Processor:
             return False
 
     async def sync_from_redis(self):
-        if await asyncio.to_thread(self._sync_from_redis_blocking):
+        res = await asyncio.to_thread(self._sync_from_redis_blocking)
+        if res == "NO_CHANGE":
+            return True
+        if res:
             await self.sync_to_knot()
             return True
         return False
@@ -688,95 +701,65 @@ class Processor:
     async def run(self):
         try:
             role = self.env.get("NODE_ROLE", "solo").lower()
+            my_id = socket.gethostname()
             is_master = role != "worker"
-            if role == "worker":
-                if await self.sync_from_redis():
-                    log("ENGINE", "Worker sync completed")
-                    return
-                fallback_solo = False
-                wait_deadline = time.time() + 900
-                while True:
-                    if not self.r:
-                        fallback_solo = True
-                    else:
-                        try:
-                            if not await self.r_exists("path:hash"):
-                                fallback_solo = True
-                            else:
-                                if await self.sync_from_redis():
-                                    log("ENGINE", "Worker sync completed")
-                                    return
-                                fallback_solo = False
-                        except Exception:
-                            fallback_solo = True
 
-                    if not fallback_solo:
-                        break
-                    if time.time() >= wait_deadline:
-                        break
-                    log(
-                        "ENGINE",
-                        "Redis unavailable or empty. Waiting for Redis before fallback...",
-                        "WARNING",
+            if self.r:
+                last_hb_raw = await self.r_get("path:last_heartbeat")
+                if last_hb_raw:
+                    last_hb = int(
+                        last_hb_raw.decode()
+                        if isinstance(last_hb_raw, bytes)
+                        else last_hb_raw
                     )
-                    await asyncio.sleep(30)
-
-                if fallback_solo:
-                    log(
-                        "ENGINE",
-                        "Redis unavailable or empty. Running in solo fallback and waiting for Redis...",
-                        "WARNING",
-                    )
-                    is_master = True
-                else:
-                    last_hb_raw = await self.r_get("path:last_heartbeat")
-                    if last_hb_raw:
-                        last_hb = int(
-                            last_hb_raw.decode()
-                            if isinstance(last_hb_raw, bytes)
-                            else last_hb_raw
+                    if int(time.time()) - last_hb > 900:
+                        log(
+                            "ENGINE",
+                            "Master heartbeat timed out. Attempting failover...",
+                            "WARNING",
                         )
-                        if int(time.time()) - last_hb > 900:
+                        lock = await self.r_set(
+                            "path:master_lock", my_id, nx=True, ex=3600
+                        )
+                        if lock:
                             log(
                                 "ENGINE",
-                                "Master heartbeat timed out. Attempting failover...",
-                                "WARNING",
+                                "I am the temporary Master now (Failover active).",
+                                "INFO",
                             )
-                            lock = await self.r_set(
-                                "path:master_lock", os.getpid(), nx=True, ex=3600
-                            )
-                            if lock:
-                                log(
-                                    "ENGINE",
-                                    "I am the temporary Master now (Failover active).",
-                                    "INFO",
+                            is_master = True
+                        else:
+                            current_m = await self.r_get("path:master_lock")
+                            if (
+                                current_m
+                                and (
+                                    current_m.decode()
+                                    if isinstance(current_m, bytes)
+                                    else current_m
                                 )
+                                == my_id
+                            ):
                                 is_master = True
                             else:
                                 log(
                                     "ENGINE",
-                                    "Another node is already handling failover. Waiting...",
+                                    "Another node is already handling failover.",
                                     "INFO",
                                 )
-                                return
-                        else:
-                            log(
-                                "ENGINE",
-                                "Master is alive. Sync failed (likely Redis lag). Waiting...",
-                                "INFO",
-                            )
-                            return
-                    else:
-                        log(
-                            "ENGINE",
-                            "Worker sync failed (no heartbeat found). Waiting...",
-                            "INFO",
-                        )
-                    return
+                                if role == "worker":
+                                    return
+
+            if role == "worker" and not is_master:
+                if await self.sync_from_redis():
+                    log("ENGINE", "Worker sync completed")
+                else:
+                    log(
+                        "ENGINE",
+                        "Worker sync failed, continuing to baseline initialization",
+                        "WARNING",
+                    )
 
             if is_master:
-                if self.r and not self.hb_task:
-                    self.hb_task = asyncio.create_task(self.heartbeat())
                 await self.update_sources()
 
             new_h = self.get_state_hash()
@@ -844,20 +827,34 @@ class Processor:
             )
             ex_deny2 = ex_common | {d for d, ex in hosts_deny2_raw if ex}
 
-            proxy_raw = {d for d, ex in hosts_proxy_raw if not ex} - ex_proxy
-            adblock_raw = {d for d, ex in hosts_ad_raw if not ex} - ex_ad
-            deny2_raw = {d for d, ex in hosts_deny2_raw if not ex} - ex_deny2
+            def strip_prefixes(domains):
+                res = set()
+                prefix_re = re.compile(
+                    r"^([0-9]*www[0-9]*|hd[0-9]*|[A-Za-z]|[0-9]+)\.", re.I
+                )
+                for d in domains:
+                    if d.count(".") >= 2:
+                        res.add(prefix_re.sub("", d))
+                    else:
+                        res.add(d)
+                return res
 
-            proxy_raw = proxy_raw - adblock_raw - deny2_raw
+            proxy_raw = {d for d, ex in hosts_proxy_raw if not ex}
+            adblock_raw = {d for d, ex in hosts_ad_raw if not ex}
+            deny2_raw = {d for d, ex in hosts_deny2_raw if not ex}
 
-            proxy_domains = optimize_trie(proxy_raw)
-            adblock_domains = optimize_trie(adblock_raw)
-            deny2_domains = optimize_trie(deny2_raw)
+            proxy_raw = strip_prefixes(proxy_raw)
+            adblock_raw = strip_prefixes(adblock_raw)
+            deny2_raw = strip_prefixes(deny2_raw)
+
+            proxy_domains = optimize_trie(proxy_raw - ex_proxy)
+            adblock_domains = sorted(list(adblock_raw - ex_ad))
+            deny2_domains = sorted(list(deny2_raw - ex_deny2))
 
             if self.env.get("ROUTE_ALL") == "y":
                 proxy_domains = ["."]
 
-            async def write_rpz(name, domains, ra=False):
+            async def write_rpz(name, domains, excluded_domains=None, ra=False):
                 out_path = RESULT_DIR / f"{name}.rpz"
                 tmp_path = out_path.with_suffix(".tmp")
 
@@ -866,6 +863,12 @@ class Processor:
                         f_out.write("$TTL 10800\n@ SOA . . (1 1 1 1 10800)\n")
                         if ra and name == "proxy":
                             f_out.write("* CNAME .\n")
+
+                        if excluded_domains:
+                            for d in sorted(excluded_domains):
+                                f_out.write(f"{d}. CNAME rpz-passthru.\n")
+                                f_out.write(f"*.{d}. CNAME rpz-passthru.\n")
+
                         for d in sorted(domains):
                             if d == ".":
                                 continue
@@ -875,9 +878,11 @@ class Processor:
                 await asyncio.to_thread(_write)
                 await asyncio.to_thread(tmp_path.rename, out_path)
 
-            await write_rpz("proxy", proxy_domains, self.env.get("ROUTE_ALL") == "y")
-            await write_rpz("deny", adblock_domains)
-            await write_rpz("deny2", deny2_domains)
+            await write_rpz(
+                "proxy", proxy_domains, ex_proxy, self.env.get("ROUTE_ALL") == "y"
+            )
+            await write_rpz("deny", adblock_domains, ex_ad)
+            await write_rpz("deny2", deny2_domains, ex_deny2)
 
             h_file_tmp = h_file.with_suffix(".tmp")
             await asyncio.to_thread(h_file_tmp.write_text, new_h)
