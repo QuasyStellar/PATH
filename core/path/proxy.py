@@ -137,11 +137,12 @@ class IPManager:
 
             if real_ip in self._inflight:
                 event = self._inflight[real_ip]
+                is_leader = False
             else:
                 event = self._inflight[real_ip] = asyncio.Event()
-                event = None
+                is_leader = True
 
-        if event:
+        if not is_leader:
             await event.wait()
             return await self.get_fake_ip(real_ip, is_v6)
 
@@ -753,32 +754,33 @@ class PathProxyResolver:
                 while not self.nft_queue.empty() and len(items) < 100:
                     items.append(self.nft_queue.get_nowait())
 
-                final_ops = {}
-                for op, ver, fake, real in items:
-                    final_ops[(ver, fake)] = (op, real)
+                try:
+                    final_ops = {}
+                    for op, ver, fake, real in items:
+                        final_ops[(ver, fake)] = (op, real)
 
-                cmds = []
-                async with self.state_lock:
-                    for (ver, fake), (op, real) in final_ops.items():
-                        in_kernel = fake in self.known_kernel_state
-                        if op == "add":
-                            if in_kernel:
+                    cmds = []
+                    async with self.state_lock:
+                        for (ver, fake), (op, real) in final_ops.items():
+                            in_kernel = fake in self.known_kernel_state
+                            if op == "add":
+                                if in_kernel:
+                                    cmds.append(
+                                        f"delete element inet path {ver}_map {{ {fake} }}"
+                                    )
+                                cmds.append(
+                                    f"add element inet path {ver}_map {{ {fake} : {real} }}"
+                                )
+                            else:
                                 cmds.append(
                                     f"delete element inet path {ver}_map {{ {fake} }}"
                                 )
-                            cmds.append(
-                                f"add element inet path {ver}_map {{ {fake} : {real} }}"
-                            )
-                        else:
-                            cmds.append(
-                                f"delete element inet path {ver}_map {{ {fake} }}"
-                            )
 
-                if cmds:
-                    await self.run_nft(cmds)
-
-                for _ in items:
-                    self.nft_queue.task_done()
+                    if cmds:
+                        await self.run_nft(cmds)
+                finally:
+                    for _ in items:
+                        self.nft_queue.task_done()
             except Exception:
                 log("NFTABLES", f"Worker error: {traceback.format_exc()}", "ERROR")
                 await asyncio.sleep(1)
@@ -869,6 +871,7 @@ class PathProxyResolver:
                     await self.recover(silent=True)
                     self.last_full_recover = now
 
+            to_enqueue = []
             async with self.lock:
                 for ver, cache in [("v4", mgr.l1_cache_v4), ("v6", mgr.l1_cache_v6)]:
                     f2r, pool = (
@@ -880,11 +883,14 @@ class PathProxyResolver:
                     ]
                     for r in to_del:
                         fake = cache[r][0]
-                        self.enqueue_nft(("del", ver, fake, r))
+                        to_enqueue.append(("del", ver, fake, r))
                         del cache[r]
                         del f2r[fake]
                         if not mgr.is_cluster:
                             pool.append(fake)
+
+            for item in to_enqueue:
+                self.enqueue_nft(item)
 
     async def recover(self, silent=True):
         if not silent:

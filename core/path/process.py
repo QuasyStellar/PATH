@@ -449,7 +449,10 @@ class Processor:
             ]:
                 p = RESULT_DIR / f
                 if p.exists():
-                    pipe.set(f"path:data:{f}", zlib.compress(p.read_bytes()))
+                    pipe.set(
+                        f"path:data:{f}",
+                        zlib.compress(await asyncio.to_thread(p.read_bytes)),
+                    )
             pipe.set("path:hash", h)
             pipe.set("path:last_heartbeat", int(time.time()))
             pipe.set("path:master_lock", my_id, ex=3600)
@@ -467,7 +470,10 @@ class Processor:
                 return False
             remote_h = remote_h.decode() if isinstance(remote_h, bytes) else remote_h
             h_file = RESULT_DIR / ".hash"
-            if h_file.exists() and h_file.read_text().strip() == remote_h:
+            if (
+                h_file.exists()
+                and (await asyncio.to_thread(h_file.read_text)).strip() == remote_h
+            ):
                 return True
             log("REDIS", "Syncing state from Master...")
             for f in [
@@ -481,11 +487,11 @@ class Processor:
                 if data:
                     out_path = RESULT_DIR / f
                     tmp_out = out_path.with_suffix(".tmp")
-                    tmp_out.write_bytes(zlib.decompress(data))
-                    tmp_out.rename(out_path)
+                    await asyncio.to_thread(tmp_out.write_bytes, zlib.decompress(data))
+                    await asyncio.to_thread(tmp_out.rename, out_path)
             tmp_h = h_file.with_suffix(".tmp")
-            tmp_h.write_text(remote_h)
-            tmp_h.rename(h_file)
+            await asyncio.to_thread(tmp_h.write_text, remote_h)
+            await asyncio.to_thread(tmp_h.rename, h_file)
             await self.sync_to_knot()
             return True
         except Exception:
@@ -504,8 +510,8 @@ class Processor:
                         last_hb.decode() if isinstance(last_hb, bytes) else last_hb
                     )
                     if int(time.time()) - last_hb > 900:
-                        lock = await asyncio.to_thread(
-                            self.r.set, "path:master_lock", my_id, nx=True, ex=3600
+                        lock = await self.r.set(
+                            "path:master_lock", my_id, nx=True, ex=3600
                         )
                         if lock:
                             is_master = True
@@ -524,9 +530,9 @@ class Processor:
             if is_master and role in ["master", "solo"]:
                 await self.update_sources()
 
-            new_h = self.get_state_hash()
+            new_h = await asyncio.to_thread(self.get_state_hash)
             h_file = RESULT_DIR / ".hash"
-            if h_file.exists() and h_file.read_text() == new_h:
+            if h_file.exists() and await asyncio.to_thread(h_file.read_text) == new_h:
                 log("ENGINE", "No changes detected, skipping generation")
                 await self.sync_to_knot()
                 if self.r and is_master:
@@ -534,8 +540,12 @@ class Processor:
                 return
 
             log("ENGINE", "Processing started")
-            in_ips, _, _ = self.load(["include-ips"], is_ip=True)
-            ex_ips, _, _ = self.load(["exclude-ips"], is_ip=True)
+            in_ips, _, _ = await asyncio.to_thread(
+                self.load, ["include-ips"], is_ip=True
+            )
+            ex_ips, _, _ = await asyncio.to_thread(
+                self.load, ["exclude-ips"], is_ip=True
+            )
             limit = int(self.env.get("AGGREGATE_COUNT", 500))
             final_routes = {}
             for fn, ver in [("route-ips.txt", 4), ("route-ips-v6.txt", 6)]:
@@ -554,19 +564,25 @@ class Processor:
                 res_nets = sub_nets_optimized(aggr, ex_nets)
                 out_path = RESULT_DIR / fn
                 tmp_path = out_path.with_suffix(".tmp")
-                tmp_path.write_text("\n".join(map(str, res_nets)))
-                tmp_path.rename(out_path)
+                await asyncio.to_thread(
+                    tmp_path.write_text, "\n".join(map(str, res_nets))
+                )
+                await asyncio.to_thread(tmp_path.rename, out_path)
                 final_routes[ver] = len(res_nets)
 
             f_cas_env = self.env.get("FILTER_CASINO") == "y"
-            hosts_proxy_raw, cas_p_set, raw_p = self.load(
-                ["include-hosts"], f_cas=f_cas_env
+            hosts_proxy_raw, cas_p_set, raw_p = await asyncio.to_thread(
+                self.load, ["include-hosts"], f_cas=f_cas_env
             )
-            hosts_ad_raw, _, raw_ad = self.load(["include-adblock-hosts", "rpz"])
-            hosts_ad_exc, _, _ = self.load(["exclude-adblock-hosts"])
-            hosts_deny2_raw, _, raw_d2 = self.load(["rpz2"])
-            ex_proxy_only, _, _ = self.load(["exclude-hosts"])
-            ex_global, _, _ = self.load(["remove-hosts"])
+            hosts_ad_raw, _, raw_ad = await asyncio.to_thread(
+                self.load, ["include-adblock-hosts", "rpz"]
+            )
+            hosts_ad_exc, _, _ = await asyncio.to_thread(
+                self.load, ["exclude-adblock-hosts"]
+            )
+            hosts_deny2_raw, _, raw_d2 = await asyncio.to_thread(self.load, ["rpz2"])
+            ex_proxy_only, _, _ = await asyncio.to_thread(self.load, ["exclude-hosts"])
+            ex_global, _, _ = await asyncio.to_thread(self.load, ["remove-hosts"])
 
             def strip_prefixes(domains):
                 res = set()
@@ -605,22 +621,26 @@ class Processor:
                 name, domains, excluded_domains=None, raw_rules=None, ra=False
             ):
                 tmp_path = RESULT_DIR / f"{name}.rpz.tmp"
-                with open(tmp_path, "w") as f:
-                    f.write("$TTL 10800\n@ SOA . . (1 1 1 1 10800)\n")
-                    if ra and name == "proxy":
-                        f.write("* CNAME .\n")
-                    if raw_rules:
-                        for r in sorted(list(raw_rules)):
-                            f.write(f"{r}\n")
-                    if excluded_domains:
-                        for d in sorted(list(excluded_domains)):
-                            f.write(
-                                f"{d}. CNAME rpz-passthru.\n*.{d}. CNAME rpz-passthru.\n"
-                            )
-                    for d in sorted(domains):
-                        if d != ".":
-                            f.write(f"{d}. CNAME .\n*.{d}. CNAME .\n")
-                tmp_path.rename(RESULT_DIR / f"{name}.rpz")
+
+                def _write():
+                    with open(tmp_path, "w") as f:
+                        f.write("$TTL 10800\n@ SOA . . (1 1 1 1 10800)\n")
+                        if ra and name == "proxy":
+                            f.write("* CNAME .\n")
+                        if raw_rules:
+                            for r in sorted(list(raw_rules)):
+                                f.write(f"{r}\n")
+                        if excluded_domains:
+                            for d in sorted(list(excluded_domains)):
+                                f.write(
+                                    f"{d}. CNAME rpz-passthru.\n*.{d}. CNAME rpz-passthru.\n"
+                                )
+                        for d in sorted(domains):
+                            if d != ".":
+                                f.write(f"{d}. CNAME .\n*.{d}. CNAME .\n")
+
+                await asyncio.to_thread(_write)
+                await asyncio.to_thread(tmp_path.rename, RESULT_DIR / f"{name}.rpz")
 
             await write_rpz(
                 "proxy",
@@ -633,8 +653,8 @@ class Processor:
             await write_rpz("deny2", deny2_final, deny2_exc, raw_d2)
 
             tmp_h = h_file.with_suffix(".tmp")
-            tmp_h.write_text(new_h)
-            tmp_h.rename(h_file)
+            await asyncio.to_thread(tmp_h.write_text, new_h)
+            await asyncio.to_thread(tmp_h.rename, h_file)
 
             await self.sync_to_knot()
             if self.r and is_master:
@@ -664,7 +684,7 @@ class Processor:
         finally:
             if self.r:
                 try:
-                    self.r.close()
+                    await self.r.close()
                 except Exception:
                     pass
 
