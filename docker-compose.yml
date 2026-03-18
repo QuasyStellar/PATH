@@ -37,6 +37,8 @@ services:
       ENABLE_IPV6: "y"
       # PUBLIC_DNS: y | n (listen on external IP)
       PUBLIC_DNS: "n"
+      # DNS_RATE_LIMIT: max UDP DNS queries per second per source IP
+      DNS_RATE_LIMIT: 300
       # AGGREGATE_COUNT: target number of IP prefixes in nftables
       AGGREGATE_COUNT: 500
       # IP: base IPv4 prefix for local gateway (e.g., 10 => 10.77.77.77)

@@ -22,7 +22,7 @@ table inet path {
     chain input {
         type filter hook input priority 0; policy accept;
         iifname "lo" accept
-        udp dport 53 meter dns_meter { ip saddr limit rate 50/second } accept
+        udp dport 53 meter dns_meter { ip saddr limit rate ${DNS_RATE_LIMIT:-300}/second } accept
         udp dport 53 drop
     }
     chain postrouting {

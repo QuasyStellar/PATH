@@ -227,7 +227,7 @@ class Processor:
             d.mkdir(parents=True, exist_ok=True)
         self.r = None
         if env.get("REDIS_URL"):
-            import redis
+            import redis.asyncio as redis
 
             try:
                 self.r = redis.from_url(
@@ -239,10 +239,10 @@ class Processor:
                 pass
 
     async def r_get(self, key):
-        return await asyncio.to_thread(self.r.get, key) if self.r else None
+        return await self.r.get(key) if self.r else None
 
     async def r_set(self, *args, **kwargs):
-        return await asyncio.to_thread(self.r.set, *args, **kwargs) if self.r else False
+        return await self.r.set(*args, **kwargs) if self.r else False
 
     def get_state_hash(self):
         h = hashlib.md5(usedforsecurity=False)
@@ -435,7 +435,7 @@ class Processor:
                     except Exception:
                         pass
 
-    def _sync_to_redis_blocking(self, h, my_id):
+    async def sync_to_redis(self, h, my_id):
         if not self.r:
             return
         try:
@@ -454,18 +454,15 @@ class Processor:
             pipe.set("path:last_heartbeat", int(time.time()))
             pipe.set("path:master_lock", my_id, ex=3600)
             pipe.publish("path:sync", "reload")
-            pipe.execute()
+            await pipe.execute()
         except Exception:
             pass
 
-    async def sync_to_redis(self, h, my_id):
-        await asyncio.to_thread(self._sync_to_redis_blocking, h, my_id)
-
-    def _sync_from_redis_blocking(self):
+    async def sync_from_redis(self):
         if not self.r:
             return False
         try:
-            remote_h = self.r.get("path:hash")
+            remote_h = await self.r.get("path:hash")
             if not remote_h:
                 return False
             remote_h = remote_h.decode() if isinstance(remote_h, bytes) else remote_h
@@ -480,7 +477,7 @@ class Processor:
                 "route-ips.txt",
                 "route-ips-v6.txt",
             ]:
-                data = self.r.get(f"path:data:{f}")
+                data = await self.r.get(f"path:data:{f}")
                 if data:
                     out_path = RESULT_DIR / f
                     tmp_out = out_path.with_suffix(".tmp")
@@ -489,15 +486,10 @@ class Processor:
             tmp_h = h_file.with_suffix(".tmp")
             tmp_h.write_text(remote_h)
             tmp_h.rename(h_file)
+            await self.sync_to_knot()
             return True
         except Exception:
             return False
-
-    async def sync_from_redis(self):
-        if await asyncio.to_thread(self._sync_from_redis_blocking):
-            await self.sync_to_knot()
-            return True
-        return False
 
     async def run(self):
         try:

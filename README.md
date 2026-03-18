@@ -98,6 +98,7 @@ Parameters are defined via environment variables in the YAML configuration files
 | `PATH_DNS` | `1` | Upstream DNS selection (1-6). See `PATH_DNS Sets` below. |
 | `ROUTE_ALL` | `n` | If `y`, proxies ALL traffic except `exclude-hosts`. |
 | `BLOCK_ADS` | `y` | Enable/Disable Adblock filtering (RPZ). |
+| `DNS_RATE_LIMIT` | `300` | Max UDP DNS queries per second per source IP. |
 | `FILTER_CASINO` | `y` | Aggressively strip gambling domains from all lists. |
 | `ENABLE_IPV6` | `y` | Enable dual-stack IPv6 support (DNS and routing). |
 | `PUBLIC_DNS` | `n` | Allow DNS to listen on external IP. |

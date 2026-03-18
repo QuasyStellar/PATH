@@ -12,17 +12,18 @@ RUN apt-get update && apt-get install -y \
     && apt-get update && apt-get install -y knot-resolver knot-resolver-module-http \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /usr/src/path/defaults /etc/knot-resolver /run/knot-resolver/control \
+RUN mkdir -p /root/path/lists/manual /root/path/lists/sources /root/path/result /root/path/download/temp \
+    && mkdir -p /etc/knot-resolver /run/knot-resolver/control \
     && touch /etc/knot-resolver/deny.rpz /etc/knot-resolver/deny2.rpz /etc/knot-resolver/proxy.rpz \
     && chmod 777 /run/knot-resolver/control
 
-WORKDIR /usr/src/path
-COPY core/path/ ./defaults/
+WORKDIR /root/path
+COPY core/path/ ./
 COPY core/sys/knot/kresd.conf /etc/knot-resolver/
 COPY core/sys/sysctl/99-path.conf /etc/sysctl.d/
 COPY core/usr/lib/knot-resolver/kres_modules/ /usr/lib/knot-resolver/kres_modules/
 
-WORKDIR /root/path
+RUN chmod +x *.sh *.py && mkdir -p /usr/src/path/defaults && cp -r lists /usr/src/path/defaults/
 
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY entrypoint.sh /entrypoint.sh

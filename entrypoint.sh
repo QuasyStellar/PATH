@@ -15,10 +15,6 @@ for f in /usr/src/path/defaults/lists/manual/*.txt; do
     if [ ! -s "$dst" ]; then cp -f "$f" "$dst"; fi
 done
 
-cp -f /usr/src/path/defaults/*.py /root/path/
-cp -f /usr/src/path/defaults/*.sh /root/path/
-chmod +x /root/path/*.sh /root/path/*.py
-
 IFACE=$(ip -4 route show default | awk '{print $5}' | head -n 1)
 [[ -z "$IFACE" ]] && IFACE=$(ip -4 route show | grep default | awk '{print $5}' | head -n 1)
 AUTO_EXT_IP=$(ip -4 addr show dev "$IFACE" | awk '/inet / {print $2}' | cut -d/ -f1 | head -n 1)
@@ -36,6 +32,7 @@ export FAKE_IP6=${FAKE_IP6:-fd00:18::}
 export EXTERNAL_IP=${EXTERNAL_IP:-$AUTO_EXT_IP}
 export FAKE_NETMASK_V4=${FAKE_NETMASK_V4:-15}
 export FAKE_NETMASK_V6=${FAKE_NETMASK_V6:-111}
+export DNS_RATE_LIMIT=${DNS_RATE_LIMIT:-300}
 export PROXY_ADDR=${PROXY_ADDR:-127.0.0.3}
 export PROXY_PORT=${PROXY_PORT:-53}
 
