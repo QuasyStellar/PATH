@@ -7,5 +7,6 @@ if [[ -f ".env" ]]; then
     set +a
 fi
 ip addr del "${IP:-10}.77.77.77/32" dev lo || true
+ip addr del "${IP:-10}.88.88.88/32" dev lo || true
 nft delete table inet path
 exit 0

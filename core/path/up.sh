@@ -8,6 +8,7 @@ if [[ -f ".env" ]]; then
     set +a
 fi
 ip addr add "${IP:-10}.77.77.77/32" dev lo 2>/dev/null || true
+ip addr add "${IP:-10}.88.88.88/32" dev lo 2>/dev/null || true
 M4="${FAKE_NETMASK_V4:-15}"; M6="${FAKE_NETMASK_V6:-111}"
 F4="${FAKE_IP:-198.18}"; F6="${FAKE_IP6:-fd00:18::}"
 NFT_TMP="$(mktemp /tmp/path.XXXXXX.nft)"

@@ -106,6 +106,8 @@ cleanup() {
 trap cleanup SIGTERM SIGINT
 
 log "PATH initializing as ${NODE_ROLE^^}..."
+log "PATH DNS: ${IP:-10}.77.77.77"
+log "Full DNS: ${IP:-10}.88.88.88"
 sysctl -p /etc/sysctl.d/99-path.conf >/dev/null || true
 
 if [[ "$NODE_ROLE" == "worker" ]]; then
@@ -124,13 +126,17 @@ EOF
 fi
 
 log "Starting PATH Engine..."
-/root/path/process.py
+if ! /root/path/process.py; then
+    log "CRITICAL: PATH Engine failed to perform initial sync. Exiting." "ERROR"
+    exit 1
+fi
 
 log "Applying network routing rules..."
 /root/path/up.sh
 
 if [[ "$NODE_ROLE" != "worker" ]]; then
-    echo "0 3 * * * /root/path/process.py" | crontab -
+    echo "0 3 * * * root . /root/path/.env; /root/path/process.py > /proc/1/fd/1 2>&1" > /etc/cron.d/path-sync
+    chmod 0644 /etc/cron.d/path-sync
 fi
 
 log "Starting PATH services via Supervisor..."

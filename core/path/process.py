@@ -272,21 +272,42 @@ class Processor:
 
     async def update_sources(self):
         url_map = {}
+        active_stems = set()
+        stems_with_urls = set()
         for f in SOURCE_DIR.glob("*.txt"):
+            stem = f.stem
+            active_stems.add(stem)
             with open(f) as f_in:
                 for line in f_in:
                     u = line.strip()
                     if u.startswith("http"):
+                        stems_with_urls.add(stem)
                         if u not in url_map:
                             url_map[u] = []
                         url_map[u].append(
                             TEMP_DIR
                             / "downloads"
-                            / f.stem
+                            / stem
                             / f"{hashlib.md5(u.encode(), usedforsecurity=False).hexdigest()[:8]}.txt"
                         )
+
+        for stem_to_clean in active_stems - stems_with_urls:
+            d_path = DOWNLOAD_DIR / stem_to_clean
+            if d_path.exists() and d_path.is_dir():
+                log("FETCHER", f"Cleaning up disabled source: {stem_to_clean}")
+                await asyncio.to_thread(shutil.rmtree, d_path)
+
         if not url_map:
+            for existing_dir in DOWNLOAD_DIR.iterdir():
+                if (
+                    existing_dir.is_dir()
+                    and existing_dir.name not in active_stems
+                    and existing_dir != TEMP_DIR
+                ):
+                    log("FETCHER", f"Removing deleted source data: {existing_dir.name}")
+                    await asyncio.to_thread(shutil.rmtree, existing_dir)
             return
+
         temp_download_dir = TEMP_DIR / "downloads"
         if temp_download_dir.exists():
             await asyncio.to_thread(shutil.rmtree, temp_download_dir)
@@ -313,6 +334,15 @@ class Processor:
                     if dest_dir.exists():
                         await asyncio.to_thread(shutil.rmtree, dest_dir)
                     await asyncio.to_thread(shutil.move, str(new_dir), str(dest_dir))
+
+            for existing_dir in DOWNLOAD_DIR.iterdir():
+                if (
+                    existing_dir.is_dir()
+                    and existing_dir.name not in active_stems
+                    and existing_dir != temp_download_dir.parent
+                ):
+                    log("FETCHER", f"Removing deleted source data: {existing_dir.name}")
+                    await asyncio.to_thread(shutil.rmtree, existing_dir)
         if TEMP_DIR.exists():
             await asyncio.to_thread(shutil.rmtree, TEMP_DIR)
 
@@ -453,6 +483,16 @@ class Processor:
                         f"path:data:{f}",
                         zlib.compress(await asyncio.to_thread(p.read_bytes)),
                     )
+
+            for p_dir in [SOURCE_DIR, MANUAL_DIR]:
+                if p_dir.exists():
+                    for f_path in p_dir.glob("*.txt"):
+                        rel_p = f_path.relative_to(WORKDIR)
+                        pipe.set(
+                            f"path:list:{rel_p}",
+                            await asyncio.to_thread(f_path.read_bytes),
+                        )
+
             pipe.set("path:hash", h)
             pipe.set("path:last_heartbeat", int(time.time()))
             pipe.set("path:master_lock", my_id, ex=3600)
@@ -470,11 +510,16 @@ class Processor:
                 return False
             remote_h = remote_h.decode() if isinstance(remote_h, bytes) else remote_h
             h_file = RESULT_DIR / ".hash"
-            if (
-                h_file.exists()
-                and (await asyncio.to_thread(h_file.read_text)).strip() == remote_h
-            ):
+            local_h = (
+                (await asyncio.to_thread(h_file.read_text)).strip()
+                if h_file.exists()
+                else None
+            )
+
+            if local_h == remote_h:
+                await self.sync_to_knot()
                 return True
+
             log("REDIS", "Syncing state from Master...")
             for f in [
                 "proxy.rpz",
@@ -489,6 +534,21 @@ class Processor:
                     tmp_out = out_path.with_suffix(".tmp")
                     await asyncio.to_thread(tmp_out.write_bytes, zlib.decompress(data))
                     await asyncio.to_thread(tmp_out.rename, out_path)
+
+            keys = await self.r.keys("path:list:*")
+            for k in keys:
+                k_str = k.decode() if isinstance(k, bytes) else k
+                rel_p = k_str.replace("path:list:", "")
+                data = await self.r.get(k)
+                if data:
+                    out_path = WORKDIR / rel_p
+                    await asyncio.to_thread(
+                        out_path.parent.mkdir, parents=True, exist_ok=True
+                    )
+                    tmp_out = out_path.with_suffix(".tmp")
+                    await asyncio.to_thread(tmp_out.write_bytes, data)
+                    await asyncio.to_thread(tmp_out.rename, out_path)
+
             tmp_h = h_file.with_suffix(".tmp")
             await asyncio.to_thread(tmp_h.write_text, remote_h)
             await asyncio.to_thread(tmp_h.rename, h_file)

@@ -725,8 +725,7 @@ class PathProxyResolver:
 
         ok, err = await _execute(lines)
         if ok:
-            lvl = "DEBUG" if len(lines) <= 2 else "INFO"
-            log("NFTABLES", f"Batch applied ({len(lines)} commands)", lvl)
+            log("NFTABLES", f"Batch applied ({len(lines)} commands)", "DEBUG")
         else:
             if "No such file" not in err and "File exists" not in err:
                 log(
@@ -857,15 +856,23 @@ class PathProxyResolver:
             return None
 
     async def garbage_collector(self):
+        my_id = socket.gethostname()
         while self.running:
             await asyncio.sleep(CLEANUP_INTERVAL)
             mgr = self.ip_manager
             now = time.time()
 
             if mgr.is_cluster:
-                await mgr.expire_redis_entries("v4", self.v4_count)
-                if self.enable_ipv6:
-                    await mgr.expire_redis_entries("v6", self.v6_count)
+                is_master = self.role != "worker"
+                if not is_master and mgr.r:
+                    m = await mgr.r.get("path:master_lock")
+                    if m and (m.decode() if isinstance(m, bytes) else m) == my_id:
+                        is_master = True
+
+                if is_master:
+                    await mgr.expire_redis_entries("v4", self.v4_count)
+                    if self.enable_ipv6:
+                        await mgr.expire_redis_entries("v6", self.v6_count)
 
                 if now - self.last_full_recover > 3600:
                     await self.recover(silent=True)
@@ -894,7 +901,7 @@ class PathProxyResolver:
 
     async def recover(self, silent=True):
         if not silent:
-            log("RECOVERY", "Syncing state from kernel NFTables (JSON)...")
+            log("RECOVERY", "Syncing state from kernel NFTables...")
         actual_nft_v4, actual_nft_v6 = {}, {}
         try:
             proc = await asyncio.create_subprocess_shell(
@@ -937,16 +944,22 @@ class PathProxyResolver:
         except Exception as e:
             log("RECOVERY", f"NFT JSON parse failed: {e}", "WARNING")
 
-        redis_sync_data, redis_sync_success, mgr = {}, False, self.ip_manager
+        redis_sync_data, redis_sync_success, mgr = (
+            {"v4": {}, "v6": {}},
+            False,
+            self.ip_manager,
+        )
         if mgr.is_cluster and mgr.r:
             try:
                 log("RECOVERY", "Fetching state from Redis cluster...")
                 for ver in ["v4", "v6"]:
-                    redis_sync_data[ver] = await mgr.r.hgetall(f"path:map:{ver}")
+                    async for key, val in mgr.r.hscan_iter(f"path:map:{ver}"):
+                        redis_sync_data[ver][key] = val
                 redis_sync_success = True
             except Exception as e:
                 log("RECOVERY", f"Redis fetch failed: {e}", "ERROR")
                 return
+
         all_nft_cmds = []
         async with self.lock:
             async with self.state_lock:
@@ -973,7 +986,8 @@ class PathProxyResolver:
                 else:
                     if not redis_sync_success:
                         return
-                    log("RECOVERY", "Applying cluster state...")
+                    total_maps = len(redis_sync_data["v4"]) + len(redis_sync_data["v6"])
+                    log("RECOVERY", f"Applying cluster state ({total_maps} domains)...")
                     self.known_kernel_state.clear()
                     for ver in ["v4", "v6"]:
                         redis_data = redis_sync_data.get(ver, {})

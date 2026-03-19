@@ -114,8 +114,15 @@ async def main():
                                             else last_hb_raw
                                         )
                                         if int(time.time()) - last_hb > 900:
-                                            should_sync = True
-                                            reason = "Master heartbeat timeout"
+                                            my_id = os.uname().nodename
+                                            if await r.set(
+                                                "path:master_lock",
+                                                my_id,
+                                                nx=True,
+                                                ex=3600,
+                                            ):
+                                                should_sync = True
+                                                reason = "Master heartbeat timeout"
 
                                     if should_sync and now - last_sync > 10:
                                         await run_sync(reason)
