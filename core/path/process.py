@@ -5,9 +5,7 @@ import sys
 import time
 import hashlib
 import ipaddress
-import subprocess
 import asyncio
-import socket
 import aiohttp
 import zlib
 import re
@@ -17,6 +15,8 @@ import filecmp
 import traceback
 from pathlib import Path
 from functools import lru_cache
+
+from config import config
 
 WORKDIR = Path(__file__).parent.absolute()
 SOURCE_DIR = WORKDIR / "lists/sources"
@@ -145,8 +145,12 @@ def validate_file(
                         try:
                             ipaddress.ip_network(ip_part, strict=False)
                             res.add(ip_part)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            log(
+                                "PARSER",
+                                f"Invalid IP/Network: {ip_part} ({e})",
+                                "DEBUG",
+                            )
                 else:
                     parsed = parse_adblock_line(line, force_exception=is_exclude_file)
                     if parsed:
@@ -155,8 +159,8 @@ def validate_file(
                             cas_set.add(v)
                         else:
                             adblock_rules.add((v, is_ex))
-    except Exception:
-        pass
+    except Exception as e:
+        log("PARSER", f"File validation failed: {path} ({e})", "DEBUG")
     return (res if is_ip else adblock_rules), cas_set, raw_rules
 
 
@@ -221,18 +225,17 @@ def sub_nets_optimized(inc_nets, exc_ips):
 
 
 class Processor:
-    def __init__(self, env):
-        self.env = env
+    def __init__(self):
         for d in [RESULT_DIR, DOWNLOAD_DIR]:
             d.mkdir(parents=True, exist_ok=True)
         self.r = None
-        if env.get("REDIS_URL"):
+        if config.redis_url:
             import redis.asyncio as redis
 
             try:
                 self.r = redis.from_url(
-                    env["REDIS_URL"],
-                    password=env.get("REDIS_PASSWORD"),
+                    config.redis_url,
+                    password=config.redis_password,
                     decode_responses=False,
                 )
             except Exception:
@@ -267,7 +270,7 @@ class Processor:
             "IP",
             "FAKE_IP",
         ]:
-            h.update(f"{k}={self.env.get(k, '')}".encode())
+            h.update(f"{k}={config.get(k, '')}".encode())
         return h.hexdigest()
 
     async def update_sources(self):
@@ -451,17 +454,15 @@ class Processor:
             if os.path.exists(ctrl_dir):
                 for s_name in os.listdir(ctrl_dir):
                     try:
-                        await asyncio.to_thread(
-                            subprocess.run,
-                            [
-                                "socat",
-                                "-",
-                                f"unix-connect:{os.path.join(ctrl_dir, s_name)}",
-                            ],
-                            input=b"cache.clear()\n",
-                            capture_output=True,
-                            timeout=5,
+                        proc = await asyncio.create_subprocess_exec(
+                            "socat",
+                            "-",
+                            f"unix-connect:{os.path.join(ctrl_dir, s_name)}",
+                            stdin=asyncio.subprocess.PIPE,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
                         )
+                        await proc.communicate(input=b"cache.clear()\n")
                     except Exception:
                         pass
 
@@ -469,7 +470,7 @@ class Processor:
         if not self.r:
             return
         try:
-            pipe = self.r.pipeline()
+            payloads = {}
             for f in [
                 "proxy.rpz",
                 "deny.rpz",
@@ -479,88 +480,139 @@ class Processor:
             ]:
                 p = RESULT_DIR / f
                 if p.exists():
-                    pipe.set(
-                        f"path:data:{f}",
-                        zlib.compress(await asyncio.to_thread(p.read_bytes)),
-                    )
+                    payloads[f] = zlib.compress(await asyncio.to_thread(p.read_bytes))
 
+            lists = {}
             for p_dir in [SOURCE_DIR, MANUAL_DIR]:
                 if p_dir.exists():
                     for f_path in p_dir.glob("*.txt"):
-                        rel_p = f_path.relative_to(WORKDIR)
-                        pipe.set(
-                            f"path:list:{rel_p}",
-                            await asyncio.to_thread(f_path.read_bytes),
-                        )
+                        rel_p = str(f_path.relative_to(WORKDIR))
+                        lists[rel_p] = await asyncio.to_thread(f_path.read_bytes)
 
-            pipe.set("path:hash", h)
-            pipe.set("path:last_heartbeat", int(time.time()))
-            pipe.set("path:master_lock", my_id, ex=3600)
-            pipe.publish("path:sync", "reload")
-            await pipe.execute()
-        except Exception:
-            pass
+            lua_push = """
+            local my_id, role, new_h = ARGV[1], ARGV[2], ARGV[3]
+            local current_lock = redis.call('GET', 'path:master_lock')
+            
+            if role ~= 'master' and current_lock and current_lock ~= my_id then
+                return {err = "LOCK_LOST"}
+            end
+            
+            for i=4, #ARGV - 1, 2 do
+                redis.call('SET', ARGV[i], ARGV[i+1])
+            end
+            
+            redis.call('SET', 'path:hash', new_h)
+            redis.call('SET', 'path:last_heartbeat', ARGV[#ARGV])
+            redis.call('SET', 'path:master_lock', my_id, 'EX', 3600)
+            redis.call('PUBLISH', 'path:sync', 'reload')
+            return "OK"
+            """
+
+            args = [my_id, config.node_role, h]
+            for f, data in payloads.items():
+                args.extend([f"path:data:{f}", data])
+            for f, data in lists.items():
+                args.extend([f"path:list:{f}", data])
+            args.append(int(time.time()))
+
+            await self.r.eval(lua_push, 0, *args)
+
+        except Exception as e:
+            if "LOCK_LOST" in str(e):
+                log("REDIS", "Master lock lost during sync, aborting", "WARNING")
+            else:
+                log("REDIS", f"Sync failed: {e}", "ERROR")
 
     async def sync_from_redis(self):
         if not self.r:
             return False
         try:
-            remote_h = await self.r.get("path:hash")
-            if not remote_h:
+            h_start = await self.r.get("path:hash")
+            if not h_start:
                 return False
-            remote_h = remote_h.decode() if isinstance(remote_h, bytes) else remote_h
+            h_start = h_start.decode() if isinstance(h_start, bytes) else h_start
+
             h_file = RESULT_DIR / ".hash"
             local_h = (
                 (await asyncio.to_thread(h_file.read_text)).strip()
                 if h_file.exists()
                 else None
             )
-
-            if local_h == remote_h:
+            if local_h == h_start:
                 await self.sync_to_knot()
                 return True
 
             log("REDIS", "Syncing state from Master...")
-            for f in [
+
+            files_to_sync = [
                 "proxy.rpz",
                 "deny.rpz",
                 "deny2.rpz",
                 "route-ips.txt",
                 "route-ips-v6.txt",
-            ]:
-                data = await self.r.get(f"path:data:{f}")
+            ]
+            raw_data = await self.r.mget([f"path:data:{f}" for f in files_to_sync])
+
+            h_end = await self.r.get("path:hash")
+            h_end = h_end.decode() if isinstance(h_end, bytes) else h_end
+            if h_start != h_end:
+                log("REDIS", "Remote state changed during sync, retrying...", "WARNING")
+                return await self.sync_from_redis()
+
+            for i, f in enumerate(files_to_sync):
+                data = raw_data[i]
                 if data:
                     out_path = RESULT_DIR / f
                     tmp_out = out_path.with_suffix(".tmp")
                     await asyncio.to_thread(tmp_out.write_bytes, zlib.decompress(data))
                     await asyncio.to_thread(tmp_out.rename, out_path)
 
-            keys = await self.r.keys("path:list:*")
-            for k in keys:
-                k_str = k.decode() if isinstance(k, bytes) else k
-                rel_p = k_str.replace("path:list:", "")
-                data = await self.r.get(k)
-                if data:
-                    out_path = WORKDIR / rel_p
-                    await asyncio.to_thread(
-                        out_path.parent.mkdir, parents=True, exist_ok=True
-                    )
-                    tmp_out = out_path.with_suffix(".tmp")
-                    await asyncio.to_thread(tmp_out.write_bytes, data)
-                    await asyncio.to_thread(tmp_out.rename, out_path)
+            batch = []
+            async for k in self.r.scan_iter("path:list:*", count=1000):
+                batch.append(k)
+                if len(batch) >= 500:
+                    list_data = await self.r.mget(batch)
+                    for i, bk in enumerate(batch):
+                        k_str = bk.decode() if isinstance(bk, bytes) else bk
+                        rel_p = k_str.replace("path:list:", "")
+                        data = list_data[i]
+                        if data:
+                            out_path = WORKDIR / rel_p
+                            await asyncio.to_thread(
+                                out_path.parent.mkdir, parents=True, exist_ok=True
+                            )
+                            tmp_out = out_path.with_suffix(".tmp")
+                            await asyncio.to_thread(tmp_out.write_bytes, data)
+                            await asyncio.to_thread(tmp_out.rename, out_path)
+                    batch = []
+            if batch:
+                list_data = await self.r.mget(batch)
+                for i, bk in enumerate(batch):
+                    k_str = bk.decode() if isinstance(bk, bytes) else bk
+                    rel_p = k_str.replace("path:list:", "")
+                    data = list_data[i]
+                    if data:
+                        out_path = WORKDIR / rel_p
+                        await asyncio.to_thread(
+                            out_path.parent.mkdir, parents=True, exist_ok=True
+                        )
+                        tmp_out = out_path.with_suffix(".tmp")
+                        await asyncio.to_thread(tmp_out.write_bytes, data)
+                        await asyncio.to_thread(tmp_out.rename, out_path)
 
             tmp_h = h_file.with_suffix(".tmp")
-            await asyncio.to_thread(tmp_h.write_text, remote_h)
+            await asyncio.to_thread(tmp_h.write_text, h_end)
             await asyncio.to_thread(tmp_h.rename, h_file)
             await self.sync_to_knot()
             return True
-        except Exception:
+        except Exception as e:
+            log("REDIS", f"Failed to sync state from Redis: {e}", "ERROR")
             return False
 
     async def run(self):
         try:
-            role = self.env.get("NODE_ROLE", "solo").lower()
-            my_id = socket.gethostname()
+            role = config.node_role
+            my_id = config.my_id
             is_master = role != "worker"
 
             if self.r:
@@ -606,7 +658,7 @@ class Processor:
             ex_ips, _, _ = await asyncio.to_thread(
                 self.load, ["exclude-ips"], is_ip=True
             )
-            limit = int(self.env.get("AGGREGATE_COUNT", 500))
+            limit = config.aggregate_count
             final_routes = {}
             for fn, ver in [("route-ips.txt", 4), ("route-ips-v6.txt", 6)]:
                 is_v6 = ver == 6
@@ -630,16 +682,20 @@ class Processor:
                 await asyncio.to_thread(tmp_path.rename, out_path)
                 final_routes[ver] = len(res_nets)
 
-            f_cas_env = self.env.get("FILTER_CASINO") == "y"
+            f_cas_env = config.filter_casino
             hosts_proxy_raw, cas_p_set, raw_p = await asyncio.to_thread(
                 self.load, ["include-hosts"], f_cas=f_cas_env
             )
-            hosts_ad_raw, _, raw_ad = await asyncio.to_thread(
-                self.load, ["include-adblock-hosts", "rpz"]
-            )
-            hosts_ad_exc, _, _ = await asyncio.to_thread(
-                self.load, ["exclude-adblock-hosts"]
-            )
+            if config.block_ads:
+                hosts_ad_raw, _, raw_ad = await asyncio.to_thread(
+                    self.load, ["include-adblock-hosts", "rpz"]
+                )
+                hosts_ad_exc, _, _ = await asyncio.to_thread(
+                    self.load, ["exclude-adblock-hosts"]
+                )
+            else:
+                hosts_ad_raw, _, raw_ad = await asyncio.to_thread(self.load, ["rpz"])
+                hosts_ad_exc = set()
             hosts_deny2_raw, _, raw_d2 = await asyncio.to_thread(self.load, ["rpz2"])
             ex_proxy_only, _, _ = await asyncio.to_thread(self.load, ["exclude-hosts"])
             ex_global, _, _ = await asyncio.to_thread(self.load, ["remove-hosts"])
@@ -707,7 +763,7 @@ class Processor:
                 proxy_domains,
                 proxy_exc,
                 raw_p,
-                self.env.get("ROUTE_ALL") == "y",
+                config.route_all,
             )
             await write_rpz("deny", ad_final, ad_exc_ext | ad_int_ex, raw_ad)
             await write_rpz("deny2", deny2_final, deny2_exc, raw_d2)
@@ -755,13 +811,7 @@ if __name__ == "__main__":
     lock_file = open(LOCK_FILE, "w")
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        env_file, env = WORKDIR / ".env", {}
-        if env_file.exists():
-            for line in env_file.read_text().splitlines():
-                if "=" in line:
-                    k, v = line.strip().split("=", 1)
-                    env[k] = v
-        asyncio.run(Processor(env).run())
+        asyncio.run(Processor().run())
         sys.exit(0)
     except OSError:
         log("ENGINE", "Another instance is already running", "WARNING")
