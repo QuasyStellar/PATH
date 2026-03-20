@@ -73,28 +73,28 @@ fi
 
 NODE_ROLE=${NODE_ROLE:-solo}
 cat <<EOF > /root/path/.env
-NODE_ROLE=$NODE_ROLE
-REDIS_URL=$REDIS_URL
-REDIS_PASSWORD=$REDIS_PASSWORD
-PATH_DNS=$PATH_DNS
-ROUTE_ALL=$ROUTE_ALL
-BLOCK_ADS=$BLOCK_ADS
-FILTER_CASINO=$FILTER_CASINO
-ENABLE_IPV6=$ENABLE_IPV6
-PUBLIC_DNS=$PUBLIC_DNS
-AGGREGATE_COUNT=$AGGREGATE_COUNT
-IP=$IP
-EXTERNAL_IP=$EXTERNAL_IP
-FAKE_IP=$FAKE_IP
-FAKE_NETMASK_V4=$FAKE_NETMASK_V4
-FAKE_IP6=$FAKE_IP6
-FAKE_NETMASK_V6=$FAKE_NETMASK_V6
-DOH_ENABLE=$DOH_ENABLE
-DOH_PORT=$DOH_PORT
-DOH_DOMAIN=$DOH_DOMAIN
-DOH_GENERATE_CERT=$DOH_GENERATE_CERT
-DOH_CERT=$DOH_CERT
-DOH_KEY=$DOH_KEY
+NODE_ROLE=$(printf '%q' "$NODE_ROLE")
+REDIS_URL=$(printf '%q' "$REDIS_URL")
+REDIS_PASSWORD=$(printf '%q' "$REDIS_PASSWORD")
+PATH_DNS=$(printf '%q' "$PATH_DNS")
+ROUTE_ALL=$(printf '%q' "$ROUTE_ALL")
+BLOCK_ADS=$(printf '%q' "$BLOCK_ADS")
+FILTER_CASINO=$(printf '%q' "$FILTER_CASINO")
+ENABLE_IPV6=$(printf '%q' "$ENABLE_IPV6")
+PUBLIC_DNS=$(printf '%q' "$PUBLIC_DNS")
+AGGREGATE_COUNT=$(printf '%q' "$AGGREGATE_COUNT")
+IP=$(printf '%q' "$IP")
+EXTERNAL_IP=$(printf '%q' "$EXTERNAL_IP")
+FAKE_IP=$(printf '%q' "$FAKE_IP")
+FAKE_NETMASK_V4=$(printf '%q' "$FAKE_NETMASK_V4")
+FAKE_IP6=$(printf '%q' "$FAKE_IP6")
+FAKE_NETMASK_V6=$(printf '%q' "$FAKE_NETMASK_V6")
+DOH_ENABLE=$(printf '%q' "$DOH_ENABLE")
+DOH_PORT=$(printf '%q' "$DOH_PORT")
+DOH_DOMAIN=$(printf '%q' "$DOH_DOMAIN")
+DOH_GENERATE_CERT=$(printf '%q' "$DOH_GENERATE_CERT")
+DOH_CERT=$(printf '%q' "$DOH_CERT")
+DOH_KEY=$(printf '%q' "$DOH_KEY")
 EOF
 chmod 600 /root/path/.env
 
@@ -106,6 +106,7 @@ cleanup() {
 trap cleanup SIGTERM SIGINT
 
 log "PATH initializing as ${NODE_ROLE^^}..."
+ulimit -n 524288
 log "PATH DNS: ${IP:-10}.77.77.77"
 log "Full DNS: ${IP:-10}.88.88.88"
 sysctl -p /etc/sysctl.d/99-path.conf >/dev/null || true

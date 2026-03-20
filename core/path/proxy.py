@@ -4,7 +4,6 @@ import asyncio
 import socket
 import time
 import argparse
-import os
 import traceback
 import json
 from ipaddress import ip_address, IPv4Network, IPv6Network
@@ -12,22 +11,23 @@ from collections import deque, OrderedDict
 from dnslib import DNSRecord, QTYPE, A, AAAA
 
 import redis.asyncio as redis
+from config import config
 
 CLEANUP_INTERVAL = 1800
 CLEANUP_EXPIRY = 7200
 
 
 def log(phase, msg, status="INFO"):
-    if status == "DEBUG" and os.getenv("DEBUG") != "y":
+    if status == "DEBUG" and not config.debug:
         return
     t = time.strftime("%H:%M:%S")
     print(f"[{t}] {f'[{status}]':9} {phase:12} | {msg}", flush=True)
 
 
 class IPManager:
-    def __init__(self, resolver, redis_url=None):
+    def __init__(self, resolver):
         self.resolver = resolver
-        self.redis_url = redis_url
+        self.redis_url = config.redis_url
         self.is_cluster = False
         self.r = None
         self.l1_cache_v4 = OrderedDict()
@@ -38,17 +38,17 @@ class IPManager:
         self.redis_touch_queue = set()
         self.last_seq = None
 
-        if redis_url:
+        if self.redis_url:
             try:
                 params = {
                     "decode_responses": True,
                     "socket_timeout": 5,
                     "retry_on_timeout": True,
                 }
-                pw = os.getenv("REDIS_PASSWORD")
+                pw = config.redis_password
                 if pw:
                     params["password"] = pw
-                self.r = redis.from_url(redis_url, **params)
+                self.r = redis.from_url(self.redis_url, **params)
             except Exception as e:
                 log("CLUSTER", f"Redis init failed: {e}", "WARNING")
 
@@ -233,28 +233,39 @@ class IPManager:
                     continue
 
                 def parse_traffic_json(json_data):
-                    v4, v6 = set(), set()
-                    data = json.loads(json_data.decode())
-                    for entry in data.get("nftables", []):
-                        if "map" in entry:
-                            m = entry["map"]
-                            if m.get("table") == "path" and m.get("name") in [
-                                "v4_map",
-                                "v6_map",
-                            ]:
-                                ver = "v4" if m["name"] == "v4_map" else "v6"
-                                dest = v4 if ver == "v4" else v6
+                    found = {"v4_map": set(), "v6_map": set()}
+                    try:
+                        # json.loads принимает bytes напрямую, экономим на .decode()
+                        data = json.loads(json_data)
+                        for entry in data.get("nftables", []):
+                            m = entry.get("map")
+                            if (
+                                m
+                                and m.get("table") == "path"
+                                and m.get("name") in found
+                            ):
+                                dest = found[m["name"]]
                                 for elem in m.get("elem", []):
                                     try:
-                                        f = (
-                                            elem[0]["elem"]["val"]
-                                            if isinstance(elem[0], dict)
-                                            else elem[0]
+                                        # Логика nftables JSON: ключ может быть объектом или строкой
+                                        val = elem[0]
+                                        key = (
+                                            val["elem"]["val"]
+                                            if isinstance(val, dict)
+                                            else val
                                         )
-                                        dest.add(str(f))
-                                    except Exception:
+                                        dest.add(str(key))
+                                    except (IndexError, KeyError, TypeError):
                                         continue
-                    return v4, v6
+                    except json.JSONDecodeError as e:
+                        log("NFTABLES", f"Failed to parse traffic JSON: {e}", "ERROR")
+                    except Exception as e:
+                        log(
+                            "NFTABLES",
+                            f"Unexpected error in traffic parser: {e}",
+                            "ERROR",
+                        )
+                    return found["v4_map"], found["v6_map"]
 
                 found_v4, found_v6 = await asyncio.to_thread(parse_traffic_json, stdout)
 
@@ -572,20 +583,22 @@ class PathProxyResolver:
         self,
         upstream_ip="127.0.0.2",
         upstream_port=53,
-        enable_ipv6=False,
-        ip_range_v4="198.18.0.0/15",
-        ip_range_v6="fd00:18::/111",
-        redis_url=None,
-        role="solo",
     ):
         self.upstream_ip, self.upstream_port = upstream_ip, upstream_port
-        self.enable_ipv6 = enable_ipv6
-        self.role = role.lower()
+        self.enable_ipv6 = config.enable_ipv6
+        self.role = config.node_role
         self.udp_transport = None
 
-        self.net_v4 = IPv4Network(ip_range_v4)
+        f4, m4, f6, m6 = (
+            config.fake_ip,
+            config.fake_netmask_v4,
+            config.fake_ip6,
+            config.fake_netmask_v6,
+        )
+
+        self.net_v4 = IPv4Network(f"{f4}.0.0/{m4}")
         self.v4_count = self.net_v4.num_addresses - 2
-        self.net_v6 = IPv6Network(ip_range_v6) if self.enable_ipv6 else None
+        self.net_v6 = IPv6Network(f"{f6}/{m6}") if self.enable_ipv6 else None
         self.v6_count = (self.net_v6.num_addresses - 2) if self.net_v6 else 0
 
         self.l1_limit = max(100000, min(self.v4_count + self.v6_count, 1000000))
@@ -608,7 +621,7 @@ class PathProxyResolver:
         self.nft_queue = asyncio.Queue(maxsize=50000)
         self.lock = asyncio.Lock()
         self.running = True
-        self.ip_manager = IPManager(self, redis_url)
+        self.ip_manager = IPManager(self)
         self.known_kernel_state = {}
         self.state_lock = asyncio.Lock()
         self.nft_exec_lock = asyncio.Lock()
@@ -629,26 +642,28 @@ class PathProxyResolver:
         return t
 
     async def heartbeat(self):
-        my_id = socket.gethostname()
+        my_id = config.my_id
         while self.running:
             try:
                 if self.ip_manager.is_cluster and self.ip_manager.r:
-                    is_master = self.role != "worker"
-                    if not is_master:
-                        lock_val = await self.ip_manager.r.get("path:master_lock")
-                        if lock_val:
-                            if isinstance(lock_val, bytes):
-                                lock_val = lock_val.decode()
-                            if lock_val == my_id:
-                                is_master = True
-                                await self.ip_manager.r.expire("path:master_lock", 3600)
-
-                    if is_master:
+                    if self.role == "master":
+                        await self.ip_manager.r.set("path:master_lock", my_id, ex=3600)
                         await self.ip_manager.r.set(
                             "path:last_heartbeat", int(time.time())
                         )
-            except Exception:
-                pass
+                    else:
+                        current_lock = await self.ip_manager.r.get("path:master_lock")
+                        if current_lock:
+                            if isinstance(current_lock, bytes):
+                                current_lock = current_lock.decode()
+
+                            if current_lock == my_id:
+                                await self.ip_manager.r.set(
+                                    "path:last_heartbeat", int(time.time())
+                                )
+                                await self.ip_manager.r.expire("path:master_lock", 3600)
+            except Exception as e:
+                log("CLUSTER", f"Heartbeat error: {e}", "DEBUG")
             await asyncio.sleep(60)
 
     async def _recover_from_overflow(self):
@@ -856,7 +871,7 @@ class PathProxyResolver:
             return None
 
     async def garbage_collector(self):
-        my_id = socket.gethostname()
+        my_id = config.my_id
         while self.running:
             await asyncio.sleep(CLEANUP_INTERVAL)
             mgr = self.ip_manager
@@ -902,6 +917,7 @@ class PathProxyResolver:
     async def recover(self, silent=True):
         if not silent:
             log("RECOVERY", "Syncing state from kernel NFTables...")
+
         actual_nft_v4, actual_nft_v6 = {}, {}
         try:
             proc = await asyncio.create_subprocess_shell(
@@ -914,28 +930,31 @@ class PathProxyResolver:
 
                 def parse_nft_json(json_data):
                     v4, v6 = {}, {}
-                    data = json.loads(json_data.decode())
-                    for entry in data.get("nftables", []):
-                        if "map" in entry:
-                            m = entry["map"]
-                            if m.get("table") == "path" and m.get("name") in [
-                                "v4_map",
-                                "v6_map",
-                            ]:
-                                ver = "v4" if m["name"] == "v4_map" else "v6"
-                                dest = v4 if ver == "v4" else v6
-                                for elem in m.get("elem", []):
-                                    try:
-                                        raw_f = elem[0]
-                                        f = (
-                                            raw_f["elem"]["val"]
-                                            if isinstance(raw_f, dict)
-                                            else raw_f
-                                        )
-                                        r = elem[1]
-                                        dest[str(f)] = str(r)
-                                    except (IndexError, KeyError, TypeError):
-                                        continue
+                    try:
+                        data = json.loads(json_data)
+                        for entry in data.get("nftables", []):
+                            if "map" in entry:
+                                m = entry["map"]
+                                if m.get("table") == "path" and m.get("name") in [
+                                    "v4_map",
+                                    "v6_map",
+                                ]:
+                                    ver = "v4" if m["name"] == "v4_map" else "v6"
+                                    dest = v4 if ver == "v4" else v6
+                                    for elem in m.get("elem", []):
+                                        try:
+                                            raw_f = elem[0]
+                                            f = (
+                                                raw_f["elem"]["val"]
+                                                if isinstance(raw_f, dict)
+                                                else raw_f
+                                            )
+                                            r = elem[1]
+                                            dest[str(f)] = str(r)
+                                        except (IndexError, KeyError, TypeError):
+                                            continue
+                    except Exception:
+                        pass
                     return v4, v6
 
                 actual_nft_v4, actual_nft_v6 = await asyncio.to_thread(
@@ -944,16 +963,21 @@ class PathProxyResolver:
         except Exception as e:
             log("RECOVERY", f"NFT JSON parse failed: {e}", "WARNING")
 
-        redis_sync_data, redis_sync_success, mgr = (
-            {"v4": {}, "v6": {}},
-            False,
-            self.ip_manager,
-        )
+        redis_sync_data = {"v4": {}, "v6": {}}
+        redis_sync_success = False
+        mgr = self.ip_manager
+        remote_seq = None
+
         if mgr.is_cluster and mgr.r:
             try:
                 log("RECOVERY", "Fetching state from Redis cluster...")
+                seq_val = await mgr.r.get("path:sequence")
+                remote_seq = int(seq_val) if seq_val else 0
+
                 for ver in ["v4", "v6"]:
-                    async for key, val in mgr.r.hscan_iter(f"path:map:{ver}"):
+                    async for key, val in mgr.r.hscan_iter(
+                        f"path:map:{ver}", count=1000
+                    ):
                         redis_sync_data[ver][key] = val
                 redis_sync_success = True
             except Exception as e:
@@ -962,6 +986,16 @@ class PathProxyResolver:
 
         all_nft_cmds = []
         async with self.lock:
+            while not self.nft_queue.empty():
+                try:
+                    self.nft_queue.get_nowait()
+                    self.nft_queue.task_done()
+                except asyncio.QueueEmpty:
+                    break
+
+            if remote_seq is not None:
+                self.last_seq = remote_seq
+
             async with self.state_lock:
                 if not mgr.is_cluster:
                     self.known_kernel_state.clear()
@@ -969,42 +1003,38 @@ class PathProxyResolver:
                     mgr.f2r_v4.clear()
                     mgr.l1_cache_v6.clear()
                     mgr.f2r_v6.clear()
-                    for fake, real in actual_nft_v4.items():
-                        now = time.time()
-                        mgr.l1_cache_v4[real], mgr.f2r_v4[fake] = (
-                            [fake, now, now, now],
-                            real,
-                        )
-                        self.known_kernel_state[fake] = real
-                    for fake, real in actual_nft_v6.items():
-                        now = time.time()
-                        mgr.l1_cache_v6[real], mgr.f2r_v6[fake] = (
-                            [fake, now, now, now],
-                            real,
-                        )
-                        self.known_kernel_state[fake] = real
+
+                    for ver, actual_nft in [
+                        ("v4", actual_nft_v4),
+                        ("v6", actual_nft_v6),
+                    ]:
+                        cache = mgr.l1_cache_v6 if ver == "v6" else mgr.l1_cache_v4
+                        f2r = mgr.f2r_v6 if ver == "v6" else mgr.f2r_v4
+                        for fake, real in actual_nft.items():
+                            now = time.time()
+                            cache[real], f2r[fake] = [fake, now, now, now], real
+                            self.known_kernel_state[fake] = real
                 else:
                     if not redis_sync_success:
                         return
+
                     total_maps = len(redis_sync_data["v4"]) + len(redis_sync_data["v6"])
                     log("RECOVERY", f"Applying cluster state ({total_maps} domains)...")
                     self.known_kernel_state.clear()
+
                     for ver in ["v4", "v6"]:
                         redis_data = redis_sync_data.get(ver, {})
-                        f2r, cache = (
-                            (mgr.f2r_v6 if ver == "v6" else mgr.f2r_v4),
-                            (mgr.l1_cache_v6 if ver == "v6" else mgr.l1_cache_v4),
-                        )
+                        f2r = mgr.f2r_v6 if ver == "v6" else mgr.f2r_v4
+                        cache = mgr.l1_cache_v6 if ver == "v6" else mgr.l1_cache_v4
                         nft_cur = actual_nft_v6 if ver == "v6" else actual_nft_v4
+
                         f2r.clear()
                         cache.clear()
                         actual_adds, actual_dels = [], []
+
                         for real, fake in redis_data.items():
                             now = time.time()
-                            f2r[fake], cache[real] = (
-                                real,
-                                [fake, now, now, now],
-                            )
+                            f2r[fake], cache[real] = real, [fake, now, now, now]
                             needs_add = True
                             if fake in nft_cur:
                                 try:
@@ -1013,6 +1043,7 @@ class PathProxyResolver:
                                         self.known_kernel_state[fake] = real
                                 except Exception:
                                     pass
+
                             if needs_add:
                                 actual_dels.append(
                                     f"delete element inet path {ver}_map {{ {fake} }}"
@@ -1020,11 +1051,13 @@ class PathProxyResolver:
                                 actual_adds.append(
                                     f"add element inet path {ver}_map {{ {fake} : {real} }}"
                                 )
+
                         for fake, real in nft_cur.items():
                             if fake not in f2r:
                                 actual_dels.append(
                                     f"delete element inet path {ver}_map {{ {fake} }}"
                                 )
+
                         all_nft_cmds.extend(actual_dels)
                         all_nft_cmds.extend(actual_adds)
 
@@ -1121,23 +1154,12 @@ class TCP:
 
 async def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--address", default=os.getenv("PROXY_ADDR", "127.0.0.3"))
-    parser.add_argument("--port", type=int, default=int(os.getenv("PROXY_PORT", 53)))
+    parser.add_argument("--address", default=config.proxy_addr)
+    parser.add_argument("--port", type=int, default=config.proxy_port)
     args = parser.parse_args()
     loop = asyncio.get_running_loop()
-    f4, m4, f6, m6 = (
-        os.getenv("FAKE_IP", "198.18"),
-        os.getenv("FAKE_NETMASK_V4", "15"),
-        os.getenv("FAKE_IP6", "fd00:18::"),
-        os.getenv("FAKE_NETMASK_V6", "111"),
-    )
-    resolver = PathProxyResolver(
-        enable_ipv6=(os.getenv("ENABLE_IPV6") == "y"),
-        redis_url=os.getenv("REDIS_URL"),
-        ip_range_v4=f"{f4}.0.0/{m4}",
-        ip_range_v6=f"{f6}/{m6}",
-        role=os.getenv("NODE_ROLE", "solo"),
-    )
+
+    resolver = PathProxyResolver()
 
     def stop():
         resolver.running = False

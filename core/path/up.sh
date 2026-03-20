@@ -44,13 +44,13 @@ table inet path {
     }
     chain nat_prerouting {
         type nat hook prerouting priority -100; policy accept;
-        ip daddr == ${F4}.0.0/${M4} dnat ip to ip daddr map @v4_map
-        $( [[ "$ENABLE_IPV6" == "y" ]] && echo "ip6 daddr == ${F6}/${M6} dnat ip6 to ip6 daddr map @v6_map" )
+        ip daddr ${F4}.0.0/${M4} dnat ip to ip daddr map @v4_map
+        $( [[ "$ENABLE_IPV6" == "y" ]] && echo "ip6 daddr ${F6}/${M6} dnat ip6 to ip6 daddr map @v6_map" )
     }
     chain nat_output {
         type nat hook output priority -100; policy accept;
-        ip daddr == ${F4}.0.0/${M4} dnat ip to ip daddr map @v4_map
-        $( [[ "$ENABLE_IPV6" == "y" ]] && echo "ip6 daddr == ${F6}/${M6} dnat ip6 to ip6 daddr map @v6_map" )
+        ip daddr ${F4}.0.0/${M4} dnat ip to ip daddr map @v4_map
+        $( [[ "$ENABLE_IPV6" == "y" ]] && echo "ip6 daddr ${F6}/${M6} dnat ip6 to ip6 daddr map @v6_map" )
     }
 }
 EOF

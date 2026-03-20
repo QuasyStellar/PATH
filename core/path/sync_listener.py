@@ -1,11 +1,11 @@
 #!/usr/bin/env -S python3 -u
 
 import asyncio
-import os
 import sys
 import time
 import redis.asyncio as redis
 from pathlib import Path
+from config import config
 
 
 def log(msg, status="INFO"):
@@ -14,12 +14,12 @@ def log(msg, status="INFO"):
 
 
 async def main():
-    redis_url = os.getenv("REDIS_URL")
+    redis_url = config.redis_url
     if not redis_url:
         log("REDIS_URL not set, sync listener disabled", "WARNING")
         return
 
-    pw = os.getenv("REDIS_PASSWORD")
+    pw = config.redis_password
     last_sync = 0
     last_check = 0
     last_hb_check = time.time()
@@ -29,7 +29,7 @@ async def main():
     process_script = current_dir / "process.py"
     result_dir = current_dir / "result"
     hash_file = result_dir / ".hash"
-    role = os.getenv("NODE_ROLE", "solo").lower()
+    role = config.node_role
 
     running = True
 
@@ -99,7 +99,11 @@ async def main():
                                         if isinstance(remote_h, bytes):
                                             remote_h = remote_h.decode()
                                         local_h = (
-                                            hash_file.read_text().strip()
+                                            (
+                                                await asyncio.to_thread(
+                                                    hash_file.read_text
+                                                )
+                                            ).strip()
                                             if hash_file.exists()
                                             else None
                                         )
@@ -114,7 +118,7 @@ async def main():
                                             else last_hb_raw
                                         )
                                         if int(time.time()) - last_hb > 900:
-                                            my_id = os.uname().nodename
+                                            my_id = config.my_id
                                             if await r.set(
                                                 "path:master_lock",
                                                 my_id,
