@@ -842,17 +842,25 @@ class PathProxyResolver:
                     asyncio.open_connection(self.upstream_ip, self.upstream_port),
                     timeout=3.0,
                 )
-                w.write(int.to_bytes(len(data), 2, "big") + data)
-                await w.drain()
-                res_len = int.from_bytes(
-                    await asyncio.wait_for(r.readexactly(2), timeout=3.0), "big"
-                )
-                res = await asyncio.wait_for(r.readexactly(res_len), timeout=3.0)
-                w.close()
-                await w.wait_closed()
-                return res
+                try:
+                    w.write(int.to_bytes(len(data), 2, "big") + data)
+                    await w.drain()
+                    res_len = int.from_bytes(
+                        await asyncio.wait_for(r.readexactly(2), timeout=3.0), "big"
+                    )
+                    res = await asyncio.wait_for(r.readexactly(res_len), timeout=3.0)
+                    return res
+                finally:
+                    try:
+                        w.close()
+                        await w.wait_closed()
+                    except Exception:
+                        pass
             else:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                family = (
+                    socket.AF_INET6 if ":" in self.upstream_ip else socket.AF_INET
+                )
+                sock = socket.socket(family, socket.SOCK_DGRAM)
                 sock.setblocking(False)
                 try:
                     loop = asyncio.get_event_loop()
@@ -873,46 +881,52 @@ class PathProxyResolver:
     async def garbage_collector(self):
         my_id = config.my_id
         while self.running:
-            await asyncio.sleep(CLEANUP_INTERVAL)
-            mgr = self.ip_manager
-            now = time.time()
+            try:
+                await asyncio.sleep(CLEANUP_INTERVAL)
+                mgr = self.ip_manager
+                now = time.time()
 
-            if mgr.is_cluster:
-                is_master = self.role != "worker"
-                if not is_master and mgr.r:
-                    m = await mgr.r.get("path:master_lock")
-                    if m and (m.decode() if isinstance(m, bytes) else m) == my_id:
-                        is_master = True
+                if mgr.is_cluster:
+                    is_master = self.role != "worker"
+                    if not is_master and mgr.r:
+                        m = await mgr.r.get("path:master_lock")
+                        if m and (m.decode() if isinstance(m, bytes) else m) == my_id:
+                            is_master = True
 
-                if is_master:
-                    await mgr.expire_redis_entries("v4", self.v4_count)
-                    if self.enable_ipv6:
-                        await mgr.expire_redis_entries("v6", self.v6_count)
+                    if is_master:
+                        await mgr.expire_redis_entries("v4", self.v4_count)
+                        if self.enable_ipv6:
+                            await mgr.expire_redis_entries("v6", self.v6_count)
 
-                if now - self.last_full_recover > 3600:
-                    await self.recover(silent=True)
-                    self.last_full_recover = now
+                    if now - self.last_full_recover > 3600:
+                        await self.recover(silent=True)
+                        self.last_full_recover = now
 
-            to_enqueue = []
-            async with self.lock:
-                for ver, cache in [("v4", mgr.l1_cache_v4), ("v6", mgr.l1_cache_v6)]:
-                    f2r, pool = (
-                        (mgr.f2r_v6 if ver == "v6" else mgr.f2r_v4),
-                        (self.ip_pool_v6 if ver == "v6" else self.ip_pool_v4),
-                    )
-                    to_del = [
-                        r for r, d in cache.items() if now - d[1] > CLEANUP_EXPIRY
-                    ]
-                    for r in to_del:
-                        fake = cache[r][0]
-                        to_enqueue.append(("del", ver, fake, r))
-                        del cache[r]
-                        del f2r[fake]
-                        if not mgr.is_cluster:
-                            pool.append(fake)
+                to_enqueue = []
+                async with self.lock:
+                    for ver, cache in [
+                        ("v4", mgr.l1_cache_v4),
+                        ("v6", mgr.l1_cache_v6),
+                    ]:
+                        f2r, pool = (
+                            (mgr.f2r_v6 if ver == "v6" else mgr.f2r_v4),
+                            (self.ip_pool_v6 if ver == "v6" else self.ip_pool_v4),
+                        )
+                        to_del = [
+                            r for r, d in cache.items() if now - d[1] > CLEANUP_EXPIRY
+                        ]
+                        for r in to_del:
+                            fake = cache[r][0]
+                            to_enqueue.append(("del", ver, fake, r))
+                            del cache[r]
+                            del f2r[fake]
+                            if not mgr.is_cluster:
+                                pool.append(fake)
 
-            for item in to_enqueue:
-                self.enqueue_nft(item)
+                for item in to_enqueue:
+                    self.enqueue_nft(item)
+            except Exception as e:
+                log("SYSTEM", f"Garbage collector error: {e}", "ERROR")
 
     async def recover(self, silent=True):
         if not silent:

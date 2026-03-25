@@ -71,30 +71,34 @@ if [[ "$DOH_ENABLE" == "y" ]]; then
     export DOH_CERT DOH_KEY
 fi
 
+quote_env() {
+    printf "'%s'" "$(printf "%s" "$1" | sed "s/'/'\\\\''/g")"
+}
+
 NODE_ROLE=${NODE_ROLE:-solo}
 cat <<EOF > /root/path/.env
-NODE_ROLE=$(printf '%q' "$NODE_ROLE")
-REDIS_URL=$(printf '%q' "$REDIS_URL")
-REDIS_PASSWORD=$(printf '%q' "$REDIS_PASSWORD")
-PATH_DNS=$(printf '%q' "$PATH_DNS")
-ROUTE_ALL=$(printf '%q' "$ROUTE_ALL")
-BLOCK_ADS=$(printf '%q' "$BLOCK_ADS")
-FILTER_CASINO=$(printf '%q' "$FILTER_CASINO")
-ENABLE_IPV6=$(printf '%q' "$ENABLE_IPV6")
-PUBLIC_DNS=$(printf '%q' "$PUBLIC_DNS")
-AGGREGATE_COUNT=$(printf '%q' "$AGGREGATE_COUNT")
-IP=$(printf '%q' "$IP")
-EXTERNAL_IP=$(printf '%q' "$EXTERNAL_IP")
-FAKE_IP=$(printf '%q' "$FAKE_IP")
-FAKE_NETMASK_V4=$(printf '%q' "$FAKE_NETMASK_V4")
-FAKE_IP6=$(printf '%q' "$FAKE_IP6")
-FAKE_NETMASK_V6=$(printf '%q' "$FAKE_NETMASK_V6")
-DOH_ENABLE=$(printf '%q' "$DOH_ENABLE")
-DOH_PORT=$(printf '%q' "$DOH_PORT")
-DOH_DOMAIN=$(printf '%q' "$DOH_DOMAIN")
-DOH_GENERATE_CERT=$(printf '%q' "$DOH_GENERATE_CERT")
-DOH_CERT=$(printf '%q' "$DOH_CERT")
-DOH_KEY=$(printf '%q' "$DOH_KEY")
+NODE_ROLE=$(quote_env "$NODE_ROLE")
+REDIS_URL=$(quote_env "$REDIS_URL")
+REDIS_PASSWORD=$(quote_env "$REDIS_PASSWORD")
+PATH_DNS=$(quote_env "$PATH_DNS")
+ROUTE_ALL=$(quote_env "$ROUTE_ALL")
+BLOCK_ADS=$(quote_env "$BLOCK_ADS")
+FILTER_CASINO=$(quote_env "$FILTER_CASINO")
+ENABLE_IPV6=$(quote_env "$ENABLE_IPV6")
+PUBLIC_DNS=$(quote_env "$PUBLIC_DNS")
+AGGREGATE_COUNT=$(quote_env "$AGGREGATE_COUNT")
+IP=$(quote_env "$IP")
+EXTERNAL_IP=$(quote_env "$EXTERNAL_IP")
+FAKE_IP=$(quote_env "$FAKE_IP")
+FAKE_NETMASK_V4=$(quote_env "$FAKE_NETMASK_V4")
+FAKE_IP6=$(quote_env "$FAKE_IP6")
+FAKE_NETMASK_V6=$(quote_env "$FAKE_NETMASK_V6")
+DOH_ENABLE=$(quote_env "$DOH_ENABLE")
+DOH_PORT=$(quote_env "$DOH_PORT")
+DOH_DOMAIN=$(quote_env "$DOH_DOMAIN")
+DOH_GENERATE_CERT=$(quote_env "$DOH_GENERATE_CERT")
+DOH_CERT=$(quote_env "$DOH_CERT")
+DOH_KEY=$(quote_env "$DOH_KEY")
 EOF
 chmod 600 /root/path/.env
 

@@ -13,6 +13,18 @@ class Config:
         self._load_os_environ()
         self._my_id = socket.gethostname()
 
+    def _unquote_env_value(self, val):
+        if val is None:
+            return None
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] == "'":
+            inner = val[1:-1]
+            return inner.replace("'\\''", "'")
+        if len(val) >= 2 and val[0] == val[-1] == '"':
+            inner = val[1:-1]
+            return inner.replace('\\"', '"').replace("\\\\", "\\")
+        return val
+
     def _load_env_file(self):
         if ENV_FILE.exists():
             with open(ENV_FILE, "r") as f:
@@ -20,7 +32,7 @@ class Config:
                     line = line.strip()
                     if line and "=" in line and not line.startswith("#"):
                         k, v = line.split("=", 1)
-                        self._env[k.strip()] = v.strip()
+                        self._env[k.strip()] = self._unquote_env_value(v.strip())
 
     def _load_os_environ(self):
         for k, v in os.environ.items():

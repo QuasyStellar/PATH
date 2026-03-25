@@ -261,7 +261,6 @@ class Processor:
                 except Exception:
                     pass
         for k in [
-            "NODE_ROLE",
             "ROUTE_ALL",
             "BLOCK_ADS",
             "FILTER_CASINO",
@@ -575,6 +574,14 @@ class Processor:
                     for i, bk in enumerate(batch):
                         k_str = bk.decode() if isinstance(bk, bytes) else bk
                         rel_p = k_str.replace("path:list:", "")
+                        if (
+                            ".." in rel_p
+                            or ":" in rel_p
+                            or rel_p.startswith("/")
+                            or not rel_p.startswith("lists/")
+                            or not rel_p.endswith(".txt")
+                        ):
+                            continue
                         data = list_data[i]
                         if data:
                             out_path = WORKDIR / rel_p
@@ -590,6 +597,14 @@ class Processor:
                 for i, bk in enumerate(batch):
                     k_str = bk.decode() if isinstance(bk, bytes) else bk
                     rel_p = k_str.replace("path:list:", "")
+                    if (
+                        ".." in rel_p
+                        or ":" in rel_p
+                        or rel_p.startswith("/")
+                        or not rel_p.startswith("lists/")
+                        or not rel_p.endswith(".txt")
+                    ):
+                        continue
                     data = list_data[i]
                     if data:
                         out_path = WORKDIR / rel_p
@@ -639,7 +654,7 @@ class Processor:
                 if await self.sync_from_redis():
                     return
 
-            if is_master and role in ["master", "solo"]:
+            if is_master:
                 await self.update_sources()
 
             new_h = await asyncio.to_thread(self.get_state_hash)
