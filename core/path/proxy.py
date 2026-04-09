@@ -109,6 +109,9 @@ class IPManager:
                     fake = data[0]
                     cache.pop(real_ip, None)
                     f2r.pop(fake, None)
+                    self.resolver.enqueue_nft(
+                        ("del", "v6" if is_v6 else "v4", fake, real_ip)
+                    )
                 else:
                     fake = data[0]
                     cache.move_to_end(real_ip)
@@ -476,14 +479,23 @@ class IPManager:
                                                 if ver == "v6"
                                                 else self.l1_cache_v4
                                             )
-                                            if real not in cache:
-                                                old_real = f2r.get(fake)
-                                                if old_real and old_real != real:
-                                                    cache.pop(old_real, None)
-                                                now = time.time()
-                                                cache[real] = [fake, now, now, now]
-                                                f2r[fake] = real
+                                            old_fake = cache.get(real, [None])[0]
+                                            if old_fake and old_fake != fake:
+                                                f2r.pop(old_fake, None)
+                                                self.resolver.enqueue_nft(
+                                                    ("del", ver, old_fake, real)
+                                                )
 
+                                            old_real = f2r.get(fake)
+                                            if old_real and old_real != real:
+                                                cache.pop(old_real, None)
+                                                self.resolver.enqueue_nft(
+                                                    ("del", ver, fake, old_real)
+                                                )
+
+                                            now = time.time()
+                                            cache[real] = [fake, now, now, now]
+                                            f2r[fake] = real
                                             self.resolver.enqueue_nft(
                                                 ("add", ver, fake, real)
                                             )
