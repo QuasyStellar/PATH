@@ -13,6 +13,7 @@ import idna
 import shutil
 import filecmp
 import traceback
+import gc
 from pathlib import Path
 from functools import lru_cache
 
@@ -34,25 +35,28 @@ CASINO_RE = re.compile(
 
 LABEL_RE = re.compile(r"^[a-z0-9_]([a-z0-9-_]{0,61}[a-z0-9_])?$", re.I)
 PREFIX_RE = re.compile(r"^([0-9]*www[0-9]*|hd[0-9]*|[A-Za-z]|[0-9]+)\.", re.I)
+DOMAIN_FAST_RE = re.compile(
+    r"^[a-z0-9_]([a-z0-9-_]{0,61}[a-z0-9_])?(\.[a-z0-9_]([a-z0-9-_]{0,61}[a-z0-9_])?)+$",
+    re.I,
+)
+
+_DEL_CHARS = str.maketrans("", "", "[]_~:/?#\\@!$&'()*+,;=")
 
 
-@lru_cache(maxsize=262144)
+@lru_cache(maxsize=1048576)
 def _normalize_domain_candidate(line):
     if not line:
         return None
-    line = line.strip().lower()
-    line = re.split(r"[]_~:/?#\[@!$&'()*+,;=]", line)[0]
-    line = line.strip(".")
+    line = line.strip().lower().translate(_DEL_CHARS).strip(".")
     if not line:
         return None
-    if not all(ord(c) < 128 for c in line):
+    try:
+        line.encode("ascii")
+    except UnicodeEncodeError:
         try:
             line = idna.encode(line).decode("ascii")
         except Exception:
-            ascii_only = "".join(c for c in line if ord(c) < 128)
-            if not ascii_only:
-                return None
-            line = ascii_only.strip(".")
+            return None
     return line
 
 
@@ -66,6 +70,8 @@ def validate_domain(line):
         return None
     is_wildcard = line.startswith("*.")
     domain_part = line[2:] if is_wildcard else line
+    if DOMAIN_FAST_RE.match(domain_part) and len(domain_part) <= 253:
+        return line
     domain_part = _normalize_domain_candidate(domain_part)
     if not domain_part or "." not in domain_part or len(domain_part) > 253:
         return None
@@ -76,26 +82,20 @@ def validate_domain(line):
     return ("*." + domain_part) if is_wildcard else domain_part
 
 
-@lru_cache(maxsize=262144)
+@lru_cache(maxsize=1048576)
 def parse_adblock_line(line, force_exception=False):
     if not line:
         return None
     line = line.strip()
-    if (
-        not line
-        or line.startswith("!")
-        or line.startswith("[")
-        or "##" in line
-        or "#@#" in line
-    ):
+    if not line or line[0] in "![" or "##" in line or "#@#" in line:
         return None
     is_ex, domain = force_exception, None
     if line.startswith("@@||"):
-        is_ex, domain = True, line[4:].split("^")[0]
+        is_ex, domain = True, line[4:].partition("^")[0]
     elif line.startswith("||"):
-        is_ex, domain = False, line[2:].split("^")[0]
+        is_ex, domain = False, line[2:].partition("^")[0]
     elif line.startswith("@@"):
-        is_ex, domain = True, line[2:].split("^")[0]
+        is_ex, domain = True, line[2:].partition("^")[0]
     else:
         domain = line
     if not domain or ("*" in domain and not domain.startswith("*.")):
@@ -112,53 +112,53 @@ def validate_file(
         return (res if is_ip else adblock_rules), cas_set, raw_rules
     try:
         with open(path, "rb") as f:
-            for line_bytes in f:
-                try:
-                    line = line_bytes.decode("utf-8", errors="replace").strip()
-                except Exception:
+            content = f.read().decode("utf-8", errors="replace")
+        _search = CASINO_RE.search
+        _validate = validate_domain
+        _parse_ad = parse_adblock_line
+        _add_ad = adblock_rules.add
+        _add_cas = cas_set.add
+        _add_raw = raw_rules.add
+        _add_ip = res.add
+        _ip_net = ipaddress.ip_network
+        for line in content.splitlines():
+            line = line.strip()
+            if not line or line[0] in "#;":
+                continue
+            if is_rpz and not is_ip:
+                if line[0] in "$@":
                     continue
-                if not line or line.startswith("#") or line.startswith(";"):
+                _add_raw(line)
+                continue
+            if is_domain and not is_ip:
+                line = line.strip("!\"#$%&'()+,-/:;<=>?@[\\]^_`{|}~")
+                if not line:
                     continue
-                if is_rpz and not is_ip:
-                    if line.startswith("$") or line.startswith("@"):
-                        continue
-                    raw_rules.add(line)
-                    continue
-                if is_domain and not is_ip:
-                    line = line.lstrip("!\"#$%&'()+,-/:;<=>?@[\\]^_`{|}~").rstrip(
-                        "!\"#$%&'()*+,-/:;<=>?@[\\]^_`{|}~"
-                    )
-                    if not line:
-                        continue
-                    v = validate_domain(line)
-                    if v:
-                        if f_cas and CASINO_RE.search(v):
-                            cas_set.add(v)
-                        else:
-                            adblock_rules.add((v, is_exclude_file))
-                    continue
-                if line[0] in "!#[]":
-                    continue
-                if is_ip:
-                    ip_part = line.partition("#")[0].strip()
-                    if ip_part:
-                        try:
-                            ipaddress.ip_network(ip_part, strict=False)
-                            res.add(ip_part)
-                        except Exception as e:
-                            log(
-                                "PARSER",
-                                f"Invalid IP/Network: {ip_part} ({e})",
-                                "DEBUG",
-                            )
-                else:
-                    parsed = parse_adblock_line(line, force_exception=is_exclude_file)
-                    if parsed:
-                        v, is_ex = parsed
-                        if f_cas and CASINO_RE.search(v):
-                            cas_set.add(v)
-                        else:
-                            adblock_rules.add((v, is_ex))
+                v = _validate(line)
+                if v:
+                    if f_cas and _search(v):
+                        _add_cas(v)
+                    else:
+                        _add_ad((v, is_exclude_file))
+                continue
+            if line[0] in "!#[]":
+                continue
+            if is_ip:
+                ip_part = line.partition("#")[0].strip()
+                if ip_part:
+                    try:
+                        _ip_net(ip_part, strict=False)
+                        _add_ip(ip_part)
+                    except Exception:
+                        pass
+            else:
+                parsed = _parse_ad(line, force_exception=is_exclude_file)
+                if parsed:
+                    v, is_ex = parsed
+                    if f_cas and _search(v):
+                        _add_cas(v)
+                    else:
+                        _add_ad((v, is_ex))
     except Exception as e:
         log("PARSER", f"File validation failed: {path} ({e})", "DEBUG")
     return (res if is_ip else adblock_rules), cas_set, raw_rules
@@ -167,21 +167,18 @@ def validate_file(
 def optimize_trie(domains):
     if not domains:
         return []
-    sorted_domains = sorted(domains, key=lambda d: (len(d), d.count(".")))
-    trie, res = {}, []
+    sorted_domains = sorted(domains, key=lambda d: (d.count("."), len(d)))
+    res, found_roots = [], set()
     for d in sorted_domains:
-        parts = d.split(".")[::-1]
-        curr, is_redundant = trie, False
-        for p in parts:
-            if "__root__" in curr:
-                is_redundant = True
+        is_sub, dot_idx = False, d.rfind(".")
+        while dot_idx != -1:
+            if d[dot_idx + 1 :] in found_roots:
+                is_sub = True
                 break
-            if p not in curr:
-                curr[p] = {}
-            curr = curr[p]
-        if not is_redundant:
-            curr["__root__"] = True
+            dot_idx = d.rfind(".", 0, dot_idx)
+        if not is_sub:
             res.append(d)
+            found_roots.add(d)
     return res
 
 
@@ -273,9 +270,7 @@ class Processor:
         return h.hexdigest()
 
     async def update_sources(self):
-        url_map = {}
-        active_stems = set()
-        stems_with_urls = set()
+        url_map, active_stems, stems_with_urls = {}, set(), set()
         for f in SOURCE_DIR.glob("*.txt"):
             stem = f.stem
             active_stems.add(stem)
@@ -292,67 +287,49 @@ class Processor:
                             / stem
                             / f"{hashlib.md5(u.encode(), usedforsecurity=False).hexdigest()[:8]}.txt"
                         )
-
-        for stem_to_clean in active_stems - stems_with_urls:
-            d_path = DOWNLOAD_DIR / stem_to_clean
-            if d_path.exists() and d_path.is_dir():
-                log("FETCHER", f"Cleaning up disabled source: {stem_to_clean}")
-                await asyncio.to_thread(shutil.rmtree, d_path)
-
+        for s in active_stems - stems_with_urls:
+            d = DOWNLOAD_DIR / s
+            if d.exists() and d.is_dir():
+                await asyncio.to_thread(shutil.rmtree, d)
         if not url_map:
-            for existing_dir in DOWNLOAD_DIR.iterdir():
-                if (
-                    existing_dir.is_dir()
-                    and existing_dir.name not in active_stems
-                    and existing_dir != TEMP_DIR
-                ):
-                    log("FETCHER", f"Removing deleted source data: {existing_dir.name}")
-                    await asyncio.to_thread(shutil.rmtree, existing_dir)
+            for ed in DOWNLOAD_DIR.iterdir():
+                if ed.is_dir() and ed.name not in active_stems and ed != TEMP_DIR:
+                    await asyncio.to_thread(shutil.rmtree, ed)
             return
-
-        temp_download_dir = TEMP_DIR / "downloads"
-        if temp_download_dir.exists():
-            await asyncio.to_thread(shutil.rmtree, temp_download_dir)
-        await asyncio.to_thread(temp_download_dir.mkdir, parents=True)
+        td = TEMP_DIR / "downloads"
+        if td.exists():
+            await asyncio.to_thread(shutil.rmtree, td)
+        await asyncio.to_thread(td.mkdir, parents=True)
         log("FETCHER", f"Checking updates for {len(url_map)} sources...")
         sem = asyncio.Semaphore(10)
-        async with aiohttp.ClientSession() as session:
-            tasks = [
-                self.fetch(session, url, paths[0], sem)
-                for url, paths in url_map.items()
-            ]
+        async with aiohttp.ClientSession() as sess:
+            tasks = [self.fetch(sess, url, ps[0], sem) for url, ps in url_map.items()]
             results = await asyncio.gather(*tasks)
-            for (url, paths), success in zip(url_map.items(), results):
+            for (url, ps), success in zip(url_map.items(), results):
                 if success:
-                    for extra_path in paths[1:]:
+                    for ep in ps[1:]:
                         await asyncio.to_thread(
-                            extra_path.parent.mkdir, parents=True, exist_ok=True
+                            ep.parent.mkdir, parents=True, exist_ok=True
                         )
-                        await asyncio.to_thread(shutil.copy, paths[0], extra_path)
-        if temp_download_dir.exists():
-            for new_dir in temp_download_dir.iterdir():
-                if new_dir.is_dir() and list(new_dir.glob("*.txt")):
-                    dest_dir = DOWNLOAD_DIR / new_dir.name
-                    if dest_dir.exists():
-                        await asyncio.to_thread(shutil.rmtree, dest_dir)
-                    await asyncio.to_thread(shutil.move, str(new_dir), str(dest_dir))
-
-            for existing_dir in DOWNLOAD_DIR.iterdir():
-                if (
-                    existing_dir.is_dir()
-                    and existing_dir.name not in active_stems
-                    and existing_dir != temp_download_dir.parent
-                ):
-                    log("FETCHER", f"Removing deleted source data: {existing_dir.name}")
-                    await asyncio.to_thread(shutil.rmtree, existing_dir)
+                        await asyncio.to_thread(shutil.copy, ps[0], ep)
+        if td.exists():
+            for nd in td.iterdir():
+                if nd.is_dir() and list(nd.glob("*.txt")):
+                    dd = DOWNLOAD_DIR / nd.name
+                    if dd.exists():
+                        await asyncio.to_thread(shutil.rmtree, dd)
+                    await asyncio.to_thread(shutil.move, str(nd), str(dd))
+            for ed in DOWNLOAD_DIR.iterdir():
+                if ed.is_dir() and ed.name not in active_stems and ed != td.parent:
+                    await asyncio.to_thread(shutil.rmtree, ed)
         if TEMP_DIR.exists():
             await asyncio.to_thread(shutil.rmtree, TEMP_DIR)
 
-    async def fetch(self, session, url, path, sem):
+    async def fetch(self, sess, url, path, sem):
         async with sem:
             try:
                 await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
-                async with session.get(url, timeout=30) as r:
+                async with sess.get(url, timeout=30) as r:
                     if r.status == 200:
                         data = await r.read()
                         if url.endswith(".gz"):
@@ -376,9 +353,11 @@ class Processor:
     def load(self, names, is_ip=False, f_cas=False):
         res, all_cas, all_raw = set(), set(), set()
         for name in names:
-            is_ex_f = name.startswith("exclude") or name.startswith("remove")
-            is_rpz_f = "rpz" in name
-            is_ad_f = "adblock" in name
+            is_ex_f, is_rpz_f, is_ad_f = (
+                name.startswith("exclude") or name.startswith("remove"),
+                "rpz" in name,
+                "adblock" in name,
+            )
             is_dom_f = ("hosts" in name or "domain" in name) and not is_ad_f
             files = []
             d_path = DOWNLOAD_DIR / name
@@ -393,7 +372,7 @@ class Processor:
             if m_path.exists():
                 files.append(m_path)
             for f in sorted(list(set(files))):
-                out, cas_s, raw_s = validate_file(
+                o, c, r = validate_file(
                     f,
                     is_ip,
                     f_cas,
@@ -401,9 +380,9 @@ class Processor:
                     is_rpz=is_rpz_f,
                     is_domain=is_dom_f,
                 )
-                res.update(out)
-                all_cas.update(cas_s)
-                all_raw.update(raw_s)
+                res.update(o)
+                all_cas.update(c)
+                all_raw.update(r)
         return res, all_cas, all_raw
 
     def aggregate(self, nets, limit, ver=4):
@@ -437,26 +416,26 @@ class Processor:
     async def sync_to_knot(self):
         log("SYNC", "Syncing RPZ zones to DNS server...")
         changed = False
-        for z in ["deny", "deny2", "proxy"]:
+        for z in ["adblock", "deny", "deny2", "proxy"]:
             src, dst = RESULT_DIR / f"{z}.rpz", KNOT_DIR / f"{z}.rpz"
             if src.exists() and (
                 not dst.exists()
                 or not await asyncio.to_thread(filecmp.cmp, src, dst, shallow=False)
             ):
-                tmp_dst = dst.with_suffix(".tmp")
-                await asyncio.to_thread(shutil.copy2, src, tmp_dst)
-                await asyncio.to_thread(os.chmod, tmp_dst, 0o644)
-                await asyncio.to_thread(tmp_dst.rename, dst)
+                tmp = dst.with_suffix(".tmp")
+                await asyncio.to_thread(shutil.copy2, src, tmp)
+                await asyncio.to_thread(os.chmod, tmp, 0o644)
+                await asyncio.to_thread(tmp.rename, dst)
                 changed = True
         if changed:
-            ctrl_dir = "/run/knot-resolver/control"
-            if os.path.exists(ctrl_dir):
-                for s_name in os.listdir(ctrl_dir):
+            cd = "/run/knot-resolver/control"
+            if os.path.exists(cd):
+                for sn in os.listdir(cd):
                     try:
                         proc = await asyncio.create_subprocess_exec(
                             "socat",
                             "-",
-                            f"unix-connect:{os.path.join(ctrl_dir, s_name)}",
+                            f"unix-connect:{os.path.join(cd, sn)}",
                             stdin=asyncio.subprocess.PIPE,
                             stdout=asyncio.subprocess.DEVNULL,
                             stderr=asyncio.subprocess.DEVNULL,
@@ -472,6 +451,7 @@ class Processor:
             payloads = {}
             for f in [
                 "proxy.rpz",
+                "adblock.rpz",
                 "deny.rpz",
                 "deny2.rpz",
                 "route-ips.txt",
@@ -480,42 +460,31 @@ class Processor:
                 p = RESULT_DIR / f
                 if p.exists():
                     payloads[f] = zlib.compress(await asyncio.to_thread(p.read_bytes))
-
             lists = {}
-            for p_dir in [SOURCE_DIR, MANUAL_DIR]:
-                if p_dir.exists():
-                    for f_path in p_dir.glob("*.txt"):
-                        rel_p = str(f_path.relative_to(WORKDIR))
-                        lists[rel_p] = await asyncio.to_thread(f_path.read_bytes)
-
-            lua_push = """
+            for pd in [SOURCE_DIR, MANUAL_DIR]:
+                if pd.exists():
+                    for fp in pd.glob("*.txt"):
+                        lists[str(fp.relative_to(WORKDIR))] = await asyncio.to_thread(
+                            fp.read_bytes
+                        )
+            lua = """
             local my_id, role, new_h = ARGV[1], ARGV[2], ARGV[3]
-            local current_lock = redis.call('GET', 'path:master_lock')
-            
-            if role ~= 'master' and current_lock and current_lock ~= my_id then
-                return {err = "LOCK_LOST"}
-            end
-            
-            for i=4, #ARGV - 1, 2 do
-                redis.call('SET', ARGV[i], ARGV[i+1])
-            end
-            
+            local lock = redis.call('GET', 'path:master_lock')
+            if role ~= 'master' and lock and lock ~= my_id then return {err = "LOCK_LOST"} end
+            for i=4, #ARGV - 1, 2 do redis.call('SET', ARGV[i], ARGV[i+1]) end
             redis.call('SET', 'path:hash', new_h)
             redis.call('SET', 'path:last_heartbeat', ARGV[#ARGV])
             redis.call('SET', 'path:master_lock', my_id, 'EX', 3600)
             redis.call('PUBLISH', 'path:sync', 'reload')
             return "OK"
             """
-
             args = [my_id, config.node_role, h]
-            for f, data in payloads.items():
-                args.extend([f"path:data:{f}", data])
-            for f, data in lists.items():
-                args.extend([f"path:list:{f}", data])
+            for f, d in payloads.items():
+                args.extend([f"path:data:{f}", d])
+            for f, d in lists.items():
+                args.extend([f"path:list:{f}", d])
             args.append(int(time.time()))
-
-            await self.r.eval(lua_push, 0, *args)
-
+            await self.r.eval(lua, 0, *args)
         except Exception as e:
             if "LOCK_LOST" in str(e):
                 log("REDIS", "Master lock lost during sync, aborting", "WARNING")
@@ -526,24 +495,19 @@ class Processor:
         if not self.r:
             return False
         try:
-            h_start = await self.r.get("path:hash")
-            if not h_start:
+            hs = await self.r.get("path:hash")
+            if not hs:
                 return False
-            h_start = h_start.decode() if isinstance(h_start, bytes) else h_start
-
-            h_file = RESULT_DIR / ".hash"
-            local_h = (
-                (await asyncio.to_thread(h_file.read_text)).strip()
-                if h_file.exists()
-                else None
+            hs = hs.decode() if isinstance(hs, bytes) else hs
+            hf = RESULT_DIR / ".hash"
+            lh = (
+                (await asyncio.to_thread(hf.read_text)).strip() if hf.exists() else None
             )
-            if local_h == h_start:
+            if lh == hs:
                 await self.sync_to_knot()
                 return True
-
             log("REDIS", "Syncing state from Master...")
-
-            files_to_sync = [
+            fts = [
                 "proxy.rpz",
                 "adblock.rpz",
                 "deny.rpz",
@@ -551,74 +515,69 @@ class Processor:
                 "route-ips.txt",
                 "route-ips-v6.txt",
             ]
-            raw_data = await self.r.mget([f"path:data:{f}" for f in files_to_sync])
-
-            h_end = await self.r.get("path:hash")
-            h_end = h_end.decode() if isinstance(h_end, bytes) else h_end
-            if h_start != h_end:
-                log("REDIS", "Remote state changed during sync, retrying...", "WARNING")
+            rd = await self.r.mget([f"path:data:{f}" for f in fts])
+            he = await self.r.get("path:hash")
+            he = he.decode() if isinstance(he, bytes) else he
+            if hs != he:
                 return await self.sync_from_redis()
-
-            for i, f in enumerate(files_to_sync):
-                data = raw_data[i]
-                if data:
-                    out_path = RESULT_DIR / f
-                    tmp_out = out_path.with_suffix(".tmp")
-                    await asyncio.to_thread(tmp_out.write_bytes, zlib.decompress(data))
-                    await asyncio.to_thread(tmp_out.rename, out_path)
-
+            for i, f in enumerate(fts):
+                d = rd[i]
+                if d:
+                    p = RESULT_DIR / f
+                    tmp = p.with_suffix(".tmp")
+                    await asyncio.to_thread(tmp.write_bytes, zlib.decompress(d))
+                    await asyncio.to_thread(tmp.rename, p)
             batch = []
             async for k in self.r.scan_iter("path:list:*", count=1000):
                 batch.append(k)
                 if len(batch) >= 500:
-                    list_data = await self.r.mget(batch)
+                    ld = await self.r.mget(batch)
                     for i, bk in enumerate(batch):
-                        k_str = bk.decode() if isinstance(bk, bytes) else bk
-                        rel_p = k_str.replace("path:list:", "")
+                        ks = bk.decode() if isinstance(bk, bytes) else bk
+                        rp = ks.replace("path:list:", "")
                         if (
-                            ".." in rel_p
-                            or ":" in rel_p
-                            or rel_p.startswith("/")
-                            or not rel_p.startswith("lists/")
-                            or not rel_p.endswith(".txt")
+                            ".." in rp
+                            or ":" in rp
+                            or rp.startswith("/")
+                            or not rp.startswith("lists/")
+                            or not rp.endswith(".txt")
                         ):
                             continue
-                        data = list_data[i]
-                        if data:
-                            out_path = WORKDIR / rel_p
+                        d = ld[i]
+                        if d:
+                            p = WORKDIR / rp
                             await asyncio.to_thread(
-                                out_path.parent.mkdir, parents=True, exist_ok=True
+                                p.parent.mkdir, parents=True, exist_ok=True
                             )
-                            tmp_out = out_path.with_suffix(".tmp")
-                            await asyncio.to_thread(tmp_out.write_bytes, data)
-                            await asyncio.to_thread(tmp_out.rename, out_path)
+                            tmp = p.with_suffix(".tmp")
+                            await asyncio.to_thread(tmp.write_bytes, d)
+                            await asyncio.to_thread(tmp.rename, p)
                     batch = []
             if batch:
-                list_data = await self.r.mget(batch)
+                ld = await self.r.mget(batch)
                 for i, bk in enumerate(batch):
-                    k_str = bk.decode() if isinstance(bk, bytes) else bk
-                    rel_p = k_str.replace("path:list:", "")
+                    ks = bk.decode() if isinstance(bk, bytes) else bk
+                    rp = ks.replace("path:list:", "")
                     if (
-                        ".." in rel_p
-                        or ":" in rel_p
-                        or rel_p.startswith("/")
-                        or not rel_p.startswith("lists/")
-                        or not rel_p.endswith(".txt")
+                        ".." in rp
+                        or ":" in rp
+                        or rp.startswith("/")
+                        or not rp.startswith("lists/")
+                        or not rp.endswith(".txt")
                     ):
                         continue
-                    data = list_data[i]
-                    if data:
-                        out_path = WORKDIR / rel_p
+                    d = ld[i]
+                    if d:
+                        p = WORKDIR / rp
                         await asyncio.to_thread(
-                            out_path.parent.mkdir, parents=True, exist_ok=True
+                            p.parent.mkdir, parents=True, exist_ok=True
                         )
-                        tmp_out = out_path.with_suffix(".tmp")
-                        await asyncio.to_thread(tmp_out.write_bytes, data)
-                        await asyncio.to_thread(tmp_out.rename, out_path)
-
-            tmp_h = h_file.with_suffix(".tmp")
-            await asyncio.to_thread(tmp_h.write_text, h_end)
-            await asyncio.to_thread(tmp_h.rename, h_file)
+                        tmp = p.with_suffix(".tmp")
+                        await asyncio.to_thread(tmp.write_bytes, d)
+                        await asyncio.to_thread(tmp.rename, p)
+            tmp_h = hf.with_suffix(".tmp")
+            await asyncio.to_thread(tmp_h.write_text, he)
+            await asyncio.to_thread(tmp_h.rename, hf)
             await self.sync_to_knot()
             return True
         except Exception as e:
@@ -627,21 +586,16 @@ class Processor:
 
     async def run(self):
         try:
-            role = config.node_role
-            my_id = config.my_id
+            role, my_id = config.node_role, config.my_id
             is_master = role != "worker"
-
             if self.r:
-                last_hb = await self.r_get("path:last_heartbeat")
-                if last_hb:
-                    last_hb = int(
-                        last_hb.decode() if isinstance(last_hb, bytes) else last_hb
-                    )
-                    if int(time.time()) - last_hb > 900:
-                        lock = await self.r.set(
+                lhb = await self.r_get("path:last_heartbeat")
+                if lhb:
+                    lhb = int(lhb.decode() if isinstance(lhb, bytes) else lhb)
+                    if int(time.time()) - lhb > 900:
+                        if await self.r.set(
                             "path:master_lock", my_id, nx=True, ex=3600
-                        )
-                        if lock:
+                        ):
                             is_master = True
                         else:
                             m = await self.r_get("path:master_lock")
@@ -650,23 +604,19 @@ class Processor:
                                 and (m.decode() if isinstance(m, bytes) else m) == my_id
                             ):
                                 is_master = True
-
             if role == "worker" and not is_master:
                 if await self.sync_from_redis():
                     return
-
             if is_master:
                 await self.update_sources()
-
             new_h = await asyncio.to_thread(self.get_state_hash)
-            h_file = RESULT_DIR / ".hash"
-            if h_file.exists() and await asyncio.to_thread(h_file.read_text) == new_h:
+            hf = RESULT_DIR / ".hash"
+            if hf.exists() and await asyncio.to_thread(hf.read_text) == new_h:
                 log("ENGINE", "No changes detected, skipping generation")
                 await self.sync_to_knot()
                 if self.r and is_master:
                     await self.sync_to_redis(new_h, my_id)
                 return
-
             log("ENGINE", "Processing started")
             in_ips, _, _ = await asyncio.to_thread(
                 self.load, ["include-ips"], is_ip=True
@@ -674,8 +624,7 @@ class Processor:
             ex_ips, _, _ = await asyncio.to_thread(
                 self.load, ["exclude-ips"], is_ip=True
             )
-            limit = config.aggregate_count
-            final_routes = {}
+            limit, final_routes = config.aggregate_count, {}
             for fn, ver in [("route-ips.txt", 4), ("route-ips-v6.txt", 6)]:
                 is_v6 = ver == 6
                 nets = [
@@ -690,32 +639,23 @@ class Processor:
                 ]
                 aggr = self.aggregate(nets, limit, ver)
                 res_nets = sub_nets_optimized(aggr, ex_nets)
-                out_path = RESULT_DIR / fn
-                tmp_path = out_path.with_suffix(".tmp")
-                await asyncio.to_thread(
-                    tmp_path.write_text, "\n".join(map(str, res_nets))
-                )
-                await asyncio.to_thread(tmp_path.rename, out_path)
+                p = RESULT_DIR / fn
+                tmp = p.with_suffix(".tmp")
+                await asyncio.to_thread(tmp.write_text, "\n".join(map(str, res_nets)))
+                await asyncio.to_thread(tmp.rename, p)
                 final_routes[ver] = len(res_nets)
-
-            f_cas_env = config.filter_casino
-            hosts_proxy_raw, cas_p_set, raw_p = await asyncio.to_thread(
-                self.load, ["include-hosts"], f_cas=f_cas_env
+            fc_env = config.filter_casino
+            hpr, cas_p, raw_p = await asyncio.to_thread(
+                self.load, ["include-hosts"], f_cas=fc_env
             )
-            
-            hosts_ad_raw, _, raw_ad = await asyncio.to_thread(
+            har, _, raw_ad = await asyncio.to_thread(
                 self.load, ["include-adblock-hosts"]
             )
-            hosts_ad_exc, _, _ = await asyncio.to_thread(
-                self.load, ["exclude-adblock-hosts"]
-            )
-            hosts_manual_raw, _, raw_manual = await asyncio.to_thread(
-                self.load, ["rpz"]
-            )
-            
-            hosts_deny2_raw, _, raw_d2 = await asyncio.to_thread(self.load, ["rpz2"])
-            ex_proxy_only, _, _ = await asyncio.to_thread(self.load, ["exclude-hosts"])
-            ex_global, _, _ = await asyncio.to_thread(self.load, ["remove-hosts"])
+            hae, _, _ = await asyncio.to_thread(self.load, ["exclude-adblock-hosts"])
+            hmr, _, raw_manual = await asyncio.to_thread(self.load, ["rpz"])
+            hd2r, _, raw_d2 = await asyncio.to_thread(self.load, ["rpz2"])
+            ex_p_only, _, _ = await asyncio.to_thread(self.load, ["exclude-hosts"])
+            ex_g, _, _ = await asyncio.to_thread(self.load, ["remove-hosts"])
 
             def strip_prefixes(domains):
                 res = set()
@@ -723,78 +663,86 @@ class Processor:
                     res.add(PREFIX_RE.sub("", d) if d.count(".") >= 2 else d)
                 return res
 
-            ex_common = {d for d, ex in ex_global}
-            proxy_inc = {d for d, ex in hosts_proxy_raw if not ex}
-            proxy_exc_raw = (
-                ex_common
-                | {d for d, ex in ex_proxy_only}
-                | {d for d, ex in hosts_proxy_raw if ex}
+            from itertools import chain
+
+            ex_common = {d for d, ex in ex_g}
+            del ex_g
+            p_inc = {d for d, ex in hpr if not ex}
+            p_exc_raw = (
+                ex_common | {d for d, ex in ex_p_only} | {d for d, ex in hpr if ex}
             )
-            p_inc_s, p_exc_s = strip_prefixes(proxy_inc), strip_prefixes(proxy_exc_raw)
-            proxy_domains = [
-                d for d in optimize_trie(p_inc_s | p_exc_s) if d not in p_exc_s
-            ]
-            proxy_exc = optimize_trie(p_exc_s)
+            pi_s, pe_s = strip_prefixes(p_inc), strip_prefixes(p_exc_raw)
+            p_doms = [d for d in optimize_trie(pi_s | pe_s) if d not in pe_s]
+            p_exc = optimize_trie(pe_s)
+            c_p_inc, c_p_exc = len(p_inc), len(p_exc_raw)
+            del p_inc, p_exc_raw, pi_s, pe_s
+            gc.collect()
+            ad_inc, ad_exc_ext, ad_int_ex = set(), set(), set()
+            ext_lookup = {d for d, ex in hae}
+            for d, ex in chain(har, hae):
+                if ex:
+                    if d in ext_lookup:
+                        ad_exc_ext.add(d)
+                    else:
+                        ad_int_ex.add(d)
+                else:
+                    ad_inc.add(d)
+            del har, hae, ext_lookup
+            ad_inc.difference_update(ad_exc_ext)
+            ad_inc.difference_update(ad_int_ex)
+            ad_inc.difference_update(ex_common)
+            c_ad_inc, c_ad_exc, c_ad_int = len(ad_inc), len(ad_exc_ext), len(ad_int_ex)
+            ad_final = sorted(list(ad_inc))
+            ad_excl = ad_exc_ext | ad_int_ex
+            del ad_inc, ad_exc_ext, ad_int_ex
+            gc.collect()
+            m_inc = {d for d, ex in hmr if not ex}
+            m_exc = {d for d, ex in hmr if ex}
+            del hmr
+            m_inc.difference_update(m_exc)
+            m_inc.difference_update(ex_common)
+            m_final = sorted(list(m_inc))
+            del m_inc
+            gc.collect()
+            d2_inc = {d for d, ex in hd2r if not ex}
+            d2_exc = {d for d, ex in hd2r if ex}
+            del hd2r
+            d2_inc.difference_update(d2_exc)
+            d2_inc.difference_update(ex_common)
+            d2_final = sorted(list(d2_inc))
+            del d2_inc
+            gc.collect()
 
-            ad_inc, ad_exc_ext, ad_int_ex = (
-                {d for d, ex in (hosts_ad_raw | hosts_ad_exc) if not ex},
-                {d for d, ex in hosts_ad_exc if ex},
-                {d for d, ex in hosts_ad_raw if ex},
-            )
-            ad_final = sorted(list(ad_inc - ad_exc_ext - ad_int_ex))
+            async def write_rpz(name, doms, excl=None, raw=None, ra=False):
+                p = RESULT_DIR / f"{name}.rpz.tmp"
 
-            manual_inc, manual_exc = (
-                {d for d, ex in hosts_manual_raw if not ex},
-                {d for d, ex in hosts_manual_raw if ex},
-            )
-            manual_final = sorted(list(manual_inc - manual_exc))
-
-            deny2_inc, deny2_exc = (
-                {d for d, ex in hosts_deny2_raw if not ex},
-                {d for d, ex in hosts_deny2_raw if ex},
-            )
-            deny2_final = sorted(list(deny2_inc - deny2_exc))
-
-            async def write_rpz(
-                name, domains, excluded_domains=None, raw_rules=None, ra=False
-            ):
-                tmp_path = RESULT_DIR / f"{name}.rpz.tmp"
-
-                def _write():
-                    with open(tmp_path, "w") as f:
+                def _w():
+                    with open(p, "w") as f:
                         f.write("$TTL 10800\n@ SOA . . (1 1 1 1 10800)\n")
                         if ra and name == "proxy":
                             f.write("* CNAME .\n")
-                        if raw_rules:
-                            for r in sorted(list(raw_rules)):
+                        if raw:
+                            for r in sorted(list(raw)):
                                 f.write(f"{r}\n")
-                        if excluded_domains:
-                            for d in sorted(list(excluded_domains)):
+                        if excl:
+                            for d in sorted(list(excl)):
                                 f.write(
                                     f"{d}. CNAME rpz-passthru.\n*.{d}. CNAME rpz-passthru.\n"
                                 )
-                        for d in sorted(domains):
+                        for d in doms:
                             if d != ".":
                                 f.write(f"{d}. CNAME .\n*.{d}. CNAME .\n")
 
-                await asyncio.to_thread(_write)
-                await asyncio.to_thread(tmp_path.rename, RESULT_DIR / f"{name}.rpz")
+                await asyncio.to_thread(_w)
+                await asyncio.to_thread(p.rename, RESULT_DIR / f"{name}.rpz")
 
-            await write_rpz(
-                "proxy",
-                proxy_domains,
-                proxy_exc,
-                raw_p,
-                config.route_all,
-            )
-            await write_rpz("adblock", ad_final, ad_exc_ext | ad_int_ex, raw_ad)
-            await write_rpz("deny", manual_final, manual_exc, raw_manual)
-            await write_rpz("deny2", deny2_final, deny2_exc, raw_d2)
-
-            tmp_h = h_file.with_suffix(".tmp")
+            await write_rpz("proxy", p_doms, p_exc, raw_p, config.route_all)
+            await write_rpz("adblock", ad_final, ad_excl, raw_ad)
+            await write_rpz("deny", m_final, m_exc, raw_manual)
+            await write_rpz("deny2", d2_final, d2_exc, raw_d2)
+            tmp_h = hf.with_suffix(".tmp")
             await asyncio.to_thread(tmp_h.write_text, new_h)
-            await asyncio.to_thread(tmp_h.rename, h_file)
-
+            await asyncio.to_thread(tmp_h.rename, hf)
             await self.sync_to_knot()
             if self.r and is_master:
                 await self.sync_to_redis(new_h, my_id)
@@ -803,18 +751,18 @@ class Processor:
             log("ENGINE", f" IPv6 Routes:    {final_routes.get(6, 0)}")
             log("ENGINE", "---------------------------------------------")
             log("ENGINE", " Proxy:")
-            log("ENGINE", f"   Included:     {len(proxy_inc)}")
-            log("ENGINE", f"   Excluded:     {len(proxy_exc_raw)}")
-            log("ENGINE", f"   Result:       {len(proxy_domains)}")
+            log("ENGINE", f"   Included:     {c_p_inc}")
+            log("ENGINE", f"   Excluded:     {c_p_exc}")
+            log("ENGINE", f"   Result:       {len(p_doms)}")
             log("ENGINE", "---------------------------------------------")
             log("ENGINE", " AdBlock:")
-            log("ENGINE", f"   Included:     {len(ad_inc)}")
-            log("ENGINE", f"   Excluded:     {len(ad_exc_ext)}")
-            log("ENGINE", f"   Internal Ex:  {len(ad_int_ex)}")
+            log("ENGINE", f"   Included:     {c_ad_inc}")
+            log("ENGINE", f"   Excluded:     {c_ad_exc}")
+            log("ENGINE", f"   Internal Ex:  {c_ad_int}")
             log("ENGINE", f"   Result:       {len(ad_final)}")
             log("ENGINE", "---------------------------------------------")
             log("ENGINE", f" Global Remove:  {len(ex_common)}")
-            log("ENGINE", f" Casino Filter:  {len(cas_p_set)}")
+            log("ENGINE", f" Casino Filter:  {len(cas_p)}")
             log("ENGINE", "=============================================")
             log("ENGINE", "Status: SUCCESS")
         except Exception:

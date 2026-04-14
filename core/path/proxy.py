@@ -710,7 +710,9 @@ class PathProxyResolver:
             cmd = "\n".join(batch) + "\n"
             async with self.nft_exec_lock:
                 proc = await asyncio.create_subprocess_exec(
-                    "nft", "-f", "-",
+                    "nft",
+                    "-f",
+                    "-",
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
@@ -874,9 +876,7 @@ class PathProxyResolver:
                     except Exception:
                         pass
             else:
-                family = (
-                    socket.AF_INET6 if ":" in self.upstream_ip else socket.AF_INET
-                )
+                family = socket.AF_INET6 if ":" in self.upstream_ip else socket.AF_INET
                 sock = socket.socket(family, socket.SOCK_DGRAM)
                 sock.setblocking(False)
                 try:
