@@ -709,8 +709,8 @@ class PathProxyResolver:
                 return True, ""
             cmd = "\n".join(batch) + "\n"
             async with self.nft_exec_lock:
-                proc = await asyncio.create_subprocess_shell(
-                    "nft -f -",
+                proc = await asyncio.create_subprocess_exec(
+                    "nft", "-f", "-",
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
@@ -828,9 +828,14 @@ class PathProxyResolver:
                 new_records = []
                 for rr in getattr(res_dns, section):
                     if rr.rtype in (QTYPE.A, QTYPE.AAAA):
-                        real_ip = str(rr.rdata)
-                        if real_ip in ("0.0.0.0", "::"):
+                        real_ip_raw = str(rr.rdata)
+                        if real_ip_raw in ("0.0.0.0", "::"):
                             new_records.append(rr)
+                            continue
+
+                        try:
+                            real_ip = str(ip_address(real_ip_raw))
+                        except ValueError:
                             continue
 
                         fake_ip = await self.ip_manager.get_fake_ip(

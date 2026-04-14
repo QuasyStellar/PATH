@@ -117,6 +117,18 @@ docker exec path /root/path/process.py
 
 ---
 
+## Security & Network Access
+
+### Redis Security
+By default, the Redis service configuration (if uncommented) is set to bind to `127.0.0.1:6379`. This prevents external access from the internet.
+
+### DNS & DoH Access
+Access is managed by `nftables` via `up.sh`:
+- **Private Mode (`PUBLIC_DNS=n`)**: By default, access is restricted to local networks and the `100.64.0.0/10` range (Netbird/Tailscale).
+- **Public Mode (`PUBLIC_DNS=y`)**: Ports 53 and 443 are open to all interfaces but protected by rate-limiting to prevent DDoS.
+
+---
+
 ## Diagnostics
 
 ### Check nftables maps
