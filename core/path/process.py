@@ -545,6 +545,7 @@ class Processor:
 
             files_to_sync = [
                 "proxy.rpz",
+                "adblock.rpz",
                 "deny.rpz",
                 "deny2.rpz",
                 "route-ips.txt",
@@ -701,16 +702,17 @@ class Processor:
             hosts_proxy_raw, cas_p_set, raw_p = await asyncio.to_thread(
                 self.load, ["include-hosts"], f_cas=f_cas_env
             )
-            if config.block_ads:
-                hosts_ad_raw, _, raw_ad = await asyncio.to_thread(
-                    self.load, ["include-adblock-hosts", "rpz"]
-                )
-                hosts_ad_exc, _, _ = await asyncio.to_thread(
-                    self.load, ["exclude-adblock-hosts"]
-                )
-            else:
-                hosts_ad_raw, _, raw_ad = await asyncio.to_thread(self.load, ["rpz"])
-                hosts_ad_exc = set()
+            
+            hosts_ad_raw, _, raw_ad = await asyncio.to_thread(
+                self.load, ["include-adblock-hosts"]
+            )
+            hosts_ad_exc, _, _ = await asyncio.to_thread(
+                self.load, ["exclude-adblock-hosts"]
+            )
+            hosts_manual_raw, _, raw_manual = await asyncio.to_thread(
+                self.load, ["rpz"]
+            )
+            
             hosts_deny2_raw, _, raw_d2 = await asyncio.to_thread(self.load, ["rpz2"])
             ex_proxy_only, _, _ = await asyncio.to_thread(self.load, ["exclude-hosts"])
             ex_global, _, _ = await asyncio.to_thread(self.load, ["remove-hosts"])
@@ -734,13 +736,18 @@ class Processor:
             ]
             proxy_exc = optimize_trie(p_exc_s)
 
-            all_ad_rules = hosts_ad_raw | hosts_ad_exc
             ad_inc, ad_exc_ext, ad_int_ex = (
-                {d for d, ex in all_ad_rules if not ex},
+                {d for d, ex in (hosts_ad_raw | hosts_ad_exc) if not ex},
                 {d for d, ex in hosts_ad_exc if ex},
                 {d for d, ex in hosts_ad_raw if ex},
             )
             ad_final = sorted(list(ad_inc - ad_exc_ext - ad_int_ex))
+
+            manual_inc, manual_exc = (
+                {d for d, ex in hosts_manual_raw if not ex},
+                {d for d, ex in hosts_manual_raw if ex},
+            )
+            manual_final = sorted(list(manual_inc - manual_exc))
 
             deny2_inc, deny2_exc = (
                 {d for d, ex in hosts_deny2_raw if not ex},
@@ -780,7 +787,8 @@ class Processor:
                 raw_p,
                 config.route_all,
             )
-            await write_rpz("deny", ad_final, ad_exc_ext | ad_int_ex, raw_ad)
+            await write_rpz("adblock", ad_final, ad_exc_ext | ad_int_ex, raw_ad)
+            await write_rpz("deny", manual_final, manual_exc, raw_manual)
             await write_rpz("deny2", deny2_final, deny2_exc, raw_d2)
 
             tmp_h = h_file.with_suffix(".tmp")

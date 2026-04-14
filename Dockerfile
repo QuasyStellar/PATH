@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y \
 
 RUN mkdir -p /root/path/lists/manual /root/path/lists/sources /root/path/result /root/path/download/temp \
     && mkdir -p /etc/knot-resolver /run/knot-resolver/control \
-    && touch /etc/knot-resolver/deny.rpz /etc/knot-resolver/deny2.rpz /etc/knot-resolver/proxy.rpz \
+    && touch /etc/knot-resolver/adblock.rpz /etc/knot-resolver/deny.rpz /etc/knot-resolver/deny2.rpz /etc/knot-resolver/proxy.rpz \
     && chmod 700 /run/knot-resolver/control
 
 WORKDIR /root/path
