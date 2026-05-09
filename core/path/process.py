@@ -14,6 +14,7 @@ import shutil
 import filecmp
 import traceback
 import gc
+from collections import Counter
 from pathlib import Path
 from functools import lru_cache
 
@@ -187,6 +188,10 @@ def sub_nets_optimized(inc_nets, exc_ips):
         return []
     if not exc_ips:
         return sorted(inc_nets)
+    
+    is_v6 = inc_nets[0].version == 6
+    addr_cls = ipaddress.IPv6Address if is_v6 else ipaddress.IPv4Address
+
     ranges = sorted(
         [(int(net.network_address), int(net.broadcast_address)) for net in inc_nets]
     )
@@ -215,7 +220,7 @@ def sub_nets_optimized(inc_nets, exc_ips):
     for s, e in result_ranges:
         final_nets.extend(
             ipaddress.summarize_address_range(
-                ipaddress.ip_address(s), ipaddress.ip_address(e)
+                addr_cls(s), addr_cls(e)
             )
         )
     return final_nets
@@ -388,29 +393,30 @@ class Processor:
     def aggregate(self, nets, limit, ver=4):
         if not nets:
             return []
-        if limit <= 0:
-            return nets
         res = list(ipaddress.collapse_addresses(nets))
-        if len(res) <= limit:
-            return res
-        target = 24 if ver == 4 else 64
-        res = list(
-            ipaddress.collapse_addresses(
-                [
-                    n.supernet(new_prefix=target) if n.prefixlen > target else n
-                    for n in res
-                ]
-            )
-        )
+        if limit <= 0 or len(res) <= limit:
+            return sorted(res)
+        
+        min_prefix = 12 if ver == 4 else 32
+        
         while len(res) > limit:
             mp = max(n.prefixlen for n in res)
-            if mp <= (12 if ver == 4 else 32):
+            if mp <= min_prefix:
                 break
-            res = list(
-                ipaddress.collapse_addresses(
-                    [n.supernet() if n.prefixlen == mp else n for n in res]
+            supers = Counter(n.supernet() if n.prefixlen == mp else n for n in res)
+            new_res = []
+            for n in res:
+                if n.prefixlen == mp and supers[n.supernet()] > 1:
+                    new_res.append(n.supernet())
+                else:
+                    new_res.append(n)
+            res = list(ipaddress.collapse_addresses(new_res))
+            if len(res) > limit and max(n.prefixlen for n in res) == mp:
+                res = list(
+                    ipaddress.collapse_addresses(
+                        [n.supernet() if n.prefixlen == mp else n for n in res]
+                    )
                 )
-            )
         return sorted(res)
 
     async def sync_to_knot(self):
@@ -444,6 +450,46 @@ class Processor:
                     except Exception:
                         pass
 
+    async def sync_to_nft(self):
+        log("SYNC", "Syncing Deny-IPs to nftables...")
+        for fn, sn in [("deny-ips.txt", "deny_v4"), ("deny-ips-v6.txt", "deny_v6")]:
+            p = RESULT_DIR / fn
+            if p.exists():
+                ips = (await asyncio.to_thread(p.read_text)).strip().splitlines()
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "nft",
+                        "flush",
+                        "set",
+                        "inet",
+                        "path",
+                        sn,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await proc.wait()
+                except Exception:
+                    pass
+
+                if ips:
+                    tmp = Path(f"/tmp/{sn}.nft")
+                    await asyncio.to_thread(
+                        tmp.write_text,
+                        f"add element inet path {sn} {{ {','.join(ips)} }}",
+                    )
+                    try:
+                        proc = await asyncio.create_subprocess_exec(
+                            "nft",
+                            "-f",
+                            str(tmp),
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        await proc.wait()
+                    finally:
+                        if tmp.exists():
+                            await asyncio.to_thread(tmp.unlink)
+
     async def sync_to_redis(self, h, my_id):
         if not self.r:
             return
@@ -456,6 +502,8 @@ class Processor:
                 "deny2.rpz",
                 "route-ips.txt",
                 "route-ips-v6.txt",
+                "deny-ips.txt",
+                "deny-ips-v6.txt",
             ]:
                 p = RESULT_DIR / f
                 if p.exists():
@@ -505,6 +553,7 @@ class Processor:
             )
             if lh == hs:
                 await self.sync_to_knot()
+                await self.sync_to_nft()
                 return True
             log("REDIS", "Syncing state from Master...")
             fts = [
@@ -514,6 +563,8 @@ class Processor:
                 "deny2.rpz",
                 "route-ips.txt",
                 "route-ips-v6.txt",
+                "deny-ips.txt",
+                "deny-ips-v6.txt",
             ]
             rd = await self.r.mget([f"path:data:{f}" for f in fts])
             he = await self.r.get("path:hash")
@@ -527,58 +578,41 @@ class Processor:
                     tmp = p.with_suffix(".tmp")
                     await asyncio.to_thread(tmp.write_bytes, zlib.decompress(d))
                     await asyncio.to_thread(tmp.rename, p)
-            batch = []
-            async for k in self.r.scan_iter("path:list:*", count=1000):
-                batch.append(k)
-                if len(batch) >= 500:
-                    ld = await self.r.mget(batch)
-                    for i, bk in enumerate(batch):
-                        ks = bk.decode() if isinstance(bk, bytes) else bk
-                        rp = ks.replace("path:list:", "")
-                        if (
-                            ".." in rp
-                            or ":" in rp
-                            or rp.startswith("/")
-                            or not rp.startswith("lists/")
-                            or not rp.endswith(".txt")
-                        ):
-                            continue
-                        d = ld[i]
-                        if d:
-                            p = WORKDIR / rp
-                            await asyncio.to_thread(
-                                p.parent.mkdir, parents=True, exist_ok=True
-                            )
-                            tmp = p.with_suffix(".tmp")
-                            await asyncio.to_thread(tmp.write_bytes, d)
-                            await asyncio.to_thread(tmp.rename, p)
-                    batch = []
-            if batch:
-                ld = await self.r.mget(batch)
-                for i, bk in enumerate(batch):
+
+            async def _save_lists(keys, data):
+                for i, bk in enumerate(keys):
                     ks = bk.decode() if isinstance(bk, bytes) else bk
                     rp = ks.replace("path:list:", "")
-                    if (
-                        ".." in rp
-                        or ":" in rp
-                        or rp.startswith("/")
-                        or not rp.startswith("lists/")
-                        or not rp.endswith(".txt")
-                    ):
+                    if ".." in rp:
                         continue
-                    d = ld[i]
+                    p = WORKDIR / rp
+                    if not p.is_relative_to(WORKDIR / "lists"):
+                        continue
+                    d = data[i]
                     if d:
-                        p = WORKDIR / rp
                         await asyncio.to_thread(
                             p.parent.mkdir, parents=True, exist_ok=True
                         )
                         tmp = p.with_suffix(".tmp")
                         await asyncio.to_thread(tmp.write_bytes, d)
                         await asyncio.to_thread(tmp.rename, p)
+
+            batch = []
+            async for k in self.r.scan_iter("path:list:*", count=1000):
+                batch.append(k)
+                if len(batch) >= 500:
+                    ld = await self.r.mget(batch)
+                    await _save_lists(batch, ld)
+                    batch = []
+            if batch:
+                ld = await self.r.mget(batch)
+                await _save_lists(batch, ld)
+
             tmp_h = hf.with_suffix(".tmp")
             await asyncio.to_thread(tmp_h.write_text, he)
             await asyncio.to_thread(tmp_h.rename, hf)
             await self.sync_to_knot()
+            await self.sync_to_nft()
             return True
         except Exception as e:
             log("REDIS", f"Failed to sync state from Redis: {e}", "ERROR")
@@ -618,32 +652,33 @@ class Processor:
                     await self.sync_to_redis(new_h, my_id)
                 return
             log("ENGINE", "Processing started")
-            in_ips, _, _ = await asyncio.to_thread(
-                self.load, ["include-ips"], is_ip=True
-            )
-            ex_ips, _, _ = await asyncio.to_thread(
-                self.load, ["exclude-ips"], is_ip=True
-            )
-            limit, final_routes = config.aggregate_count, {}
-            for fn, ver in [("route-ips.txt", 4), ("route-ips-v6.txt", 6)]:
+            in_ips, _, _ = await asyncio.to_thread(self.load, ["include-ips"], is_ip=True)
+            ex_ips, _, _ = await asyncio.to_thread(self.load, ["exclude-ips"], is_ip=True)
+            dn_ips, _, _ = await asyncio.to_thread(self.load, ["deny-ips"], is_ip=True)
+            limit, f_routes, f_deny = config.aggregate_count, {}, {}
+
+            for fn, ver in [("deny-ips.txt", 4), ("deny-ips-v6.txt", 6)]:
                 is_v6 = ver == 6
-                nets = [
-                    ipaddress.ip_network(i, False)
-                    for i in in_ips
-                    if (":" in i) == is_v6
-                ]
-                ex_nets = [
-                    ipaddress.ip_network(i, False)
-                    for i in ex_ips
-                    if (":" in i) == is_v6
-                ]
-                aggr = self.aggregate(nets, limit, ver)
-                res_nets = sub_nets_optimized(aggr, ex_nets)
+                nets = [ipaddress.ip_network(i, False) for i in dn_ips if (":" in i) == is_v6]
+                ex_nets = [ipaddress.ip_network(i, False) for i in ex_ips if (":" in i) == is_v6]
+                res_nets = sub_nets_optimized(nets, ex_nets)
                 p = RESULT_DIR / fn
                 tmp = p.with_suffix(".tmp")
                 await asyncio.to_thread(tmp.write_text, "\n".join(map(str, res_nets)))
                 await asyncio.to_thread(tmp.rename, p)
-                final_routes[ver] = len(res_nets)
+                f_deny[ver] = len(res_nets)
+
+            for fn, ver in [("route-ips.txt", 4), ("route-ips-v6.txt", 6)]:
+                is_v6 = ver == 6
+                nets = [ipaddress.ip_network(i, False) for i in in_ips if (":" in i) == is_v6]
+                ex_nets = [ipaddress.ip_network(i, False) for i in (ex_ips | dn_ips) if (":" in i) == is_v6]
+                res_nets = sub_nets_optimized(nets, ex_nets)
+                aggr = self.aggregate(res_nets, limit, ver)
+                p = RESULT_DIR / fn
+                tmp = p.with_suffix(".tmp")
+                await asyncio.to_thread(tmp.write_text, "\n".join(map(str, aggr)))
+                await asyncio.to_thread(tmp.rename, p)
+                f_routes[ver] = len(aggr)
             fc_env = config.filter_casino
             hpr, cas_p, raw_p = await asyncio.to_thread(
                 self.load, ["include-hosts"], f_cas=fc_env
@@ -744,11 +779,14 @@ class Processor:
             await asyncio.to_thread(tmp_h.write_text, new_h)
             await asyncio.to_thread(tmp_h.rename, hf)
             await self.sync_to_knot()
+            await self.sync_to_nft()
             if self.r and is_master:
                 await self.sync_to_redis(new_h, my_id)
             log("ENGINE", "=============================================")
-            log("ENGINE", f" IPv4 Routes:    {final_routes.get(4, 0)}")
-            log("ENGINE", f" IPv6 Routes:    {final_routes.get(6, 0)}")
+            log("ENGINE", f" IPv4 Routes:    {f_routes.get(4, 0)}")
+            log("ENGINE", f" IPv6 Routes:    {f_routes.get(6, 0)}")
+            log("ENGINE", f" IPv4 Deny:      {f_deny.get(4, 0)}")
+            log("ENGINE", f" IPv6 Deny:      {f_deny.get(6, 0)}")
             log("ENGINE", "---------------------------------------------")
             log("ENGINE", " Proxy:")
             log("ENGINE", f"   Included:     {c_p_inc}")

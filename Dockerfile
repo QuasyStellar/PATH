@@ -4,7 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV LC_ALL=C
 
 RUN apt-get update && apt-get install -y \
-    curl gpg git idn socat lsb-release nftables dnsutils \
+    curl gpg git idn socat lsb-release nftables dnsutils ethtool \
     python3-dnslib python3-aiohttp python3-idna python3-redis \
     iproute2 procps cron supervisor certbot \
     && curl -fL https://pkg.labs.nic.cz/gpg -o /etc/apt/keyrings/cznic-labs-pkg.gpg \

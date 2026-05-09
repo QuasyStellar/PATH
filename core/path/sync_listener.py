@@ -138,9 +138,6 @@ async def main():
             if not running:
                 break
             log(f"Connection lost: {e}. Retrying in {backoff}s...", "WARNING")
-            if backoff >= 60:
-                log("Critical connection failure, exiting for restart", "ERROR")
-                sys.exit(1)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 

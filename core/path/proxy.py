@@ -53,6 +53,7 @@ class IPManager:
                 log("CLUSTER", f"Redis init failed: {e}", "WARNING")
 
     async def check_connection(self):
+        backoff = 5
         while self.resolver.running:
             if not self.r:
                 self.is_cluster = False
@@ -63,6 +64,7 @@ class IPManager:
                 if not self.is_cluster:
                     log("CLUSTER", "Connected to Redis cluster storage")
                     self.is_cluster = True
+                    backoff = 5
 
                     await self.resolver.recover(silent=True)
 
@@ -91,11 +93,15 @@ class IPManager:
                         self.resolver.create_bg_task(
                             self.traffic_touch_worker(), "traffic_touch_worker"
                         )
+                await asyncio.sleep(30)
             except Exception as e:
                 if self.is_cluster:
                     log("CLUSTER", f"Redis connection lost: {e}", "WARNING")
                     self.is_cluster = False
-            await asyncio.sleep(10)
+                
+                log("CLUSTER", f"Redis reconnecting in {backoff}s...", "DEBUG")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 300)
 
     async def get_fake_ip(self, real_ip, is_v6=False):
         async with self.resolver.lock:
@@ -238,7 +244,6 @@ class IPManager:
                 def parse_traffic_json(json_data):
                     found = {"v4_map": set(), "v6_map": set()}
                     try:
-                        # json.loads принимает bytes напрямую, экономим на .decode()
                         data = json.loads(json_data)
                         for entry in data.get("nftables", []):
                             m = entry.get("map")
@@ -250,7 +255,6 @@ class IPManager:
                                 dest = found[m["name"]]
                                 for elem in m.get("elem", []):
                                     try:
-                                        # Логика nftables JSON: ключ может быть объектом или строкой
                                         val = elem[0]
                                         key = (
                                             val["elem"]["val"]
