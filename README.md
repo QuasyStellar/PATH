@@ -30,6 +30,7 @@ All parameters are defined via environment variables in the YAML configuration f
 | `FILTER_CASINO` | `y` | Aggressively strip gambling domains from text and adblock lists. |
 | `DNS_RATE_LIMIT` | `300` | Max UDP DNS queries per second per source IP. |
 | `ENABLE_IPV6` | `y` | Enable dual-stack IPv6 support (DNS and routing). |
+| `IPV6_PROXY_ONLY`| `n` | If `y`, returns SOA for AAAA queries on PATH DNS (forces IPv4 for non-proxied domains). |
 | `PUBLIC_DNS` | `n` | Allow DNS to listen on external IP (PATH DNS only). |
 | `AGGREGATE_COUNT`| `500` | Target limit for the number of IP prefixes in nftables. |
 | `IP` | `10` | Base IPv4 prefix for local gateways (e.g., `10.77.77.77`). |
