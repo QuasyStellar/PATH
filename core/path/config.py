@@ -92,6 +92,10 @@ class Config:
         return self.get("ENABLE_IPV6", "y", cast=bool)
 
     @property
+    def ipv6_proxy_only(self):
+        return self.get("IPV6_PROXY_ONLY", "n", cast=bool)
+
+    @property
     def public_dns(self):
         return self.get("PUBLIC_DNS", "n", cast=bool)
 

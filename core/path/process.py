@@ -267,6 +267,7 @@ class Processor:
             "BLOCK_ADS",
             "FILTER_CASINO",
             "ENABLE_IPV6",
+            "IPV6_PROXY_ONLY",
             "AGGREGATE_COUNT",
             "IP",
             "FAKE_IP",
