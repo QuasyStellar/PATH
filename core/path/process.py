@@ -165,6 +165,19 @@ def validate_file(
     return (res if is_ip else adblock_rules), cas_set, raw_rules
 
 
+def are_dirs_identical(dir1, dir2):
+    if not dir1.exists() or not dir2.exists():
+        return False
+    files1 = sorted([f.name for f in dir1.glob("*.txt")])
+    files2 = sorted([f.name for f in dir2.glob("*.txt")])
+    if files1 != files2:
+        return False
+    for name in files1:
+        if not filecmp.cmp(dir1 / name, dir2 / name, shallow=False):
+            return False
+    return True
+
+
 def optimize_trie(domains):
     if not domains:
         return []
@@ -322,6 +335,8 @@ class Processor:
             for nd in td.iterdir():
                 if nd.is_dir() and list(nd.glob("*.txt")):
                     dd = DOWNLOAD_DIR / nd.name
+                    if are_dirs_identical(nd, dd):
+                        continue
                     if dd.exists():
                         await asyncio.to_thread(shutil.rmtree, dd)
                     await asyncio.to_thread(shutil.move, str(nd), str(dd))
@@ -335,21 +350,40 @@ class Processor:
         async with sem:
             try:
                 await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
-                async with sess.get(url, timeout=30) as r:
+                
+                # Check if we have an existing file to compare or use for conditional GET
+                final_path = DOWNLOAD_DIR / path.relative_to(TEMP_DIR / "downloads")
+                
+                headers = {}
+                if final_path.exists():
+                    try:
+                        import email.utils
+                        mtime = final_path.stat().st_mtime
+                        headers["If-Modified-Since"] = email.utils.formatdate(mtime, usegmt=True)
+                    except Exception:
+                        pass
+                
+                async with sess.get(url, timeout=30, headers=headers) as r:
+                    if r.status == 304:
+                        if final_path.exists():
+                            await asyncio.to_thread(shutil.copy, final_path, path)
+                            return True
+                    
                     if r.status == 200:
                         data = await r.read()
                         if url.endswith(".gz"):
                             data = zlib.decompress(data, 16 + zlib.MAX_WBITS)
                         if len(data) < 10 or b"<html" in data[:512].lower():
                             return False
-                        if (
-                            path.exists()
-                            and hashlib.md5(data, usedforsecurity=False).hexdigest()
-                            == hashlib.md5(
-                                path.read_bytes(), usedforsecurity=False
-                            ).hexdigest()
-                        ):
-                            return True
+                        
+                        if final_path.exists():
+                            try:
+                                if hashlib.md5(data, usedforsecurity=False).hexdigest() == hashlib.md5(final_path.read_bytes(), usedforsecurity=False).hexdigest():
+                                    await asyncio.to_thread(shutil.copy, final_path, path)
+                                    return True
+                            except Exception:
+                                pass
+                        
                         await asyncio.to_thread(path.write_bytes, data)
                         return True
             except Exception:
