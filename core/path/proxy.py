@@ -876,8 +876,6 @@ class PathProxyResolver:
             dns = DNSRecord.parse(packet)
             if dns.header.qr or not dns.questions:
                 return packet
-            if dns.q.qtype not in (QTYPE.A, QTYPE.AAAA):
-                return packet
             res_pkt = await self.resolve_up(packet, is_tcp)
             if not res_pkt:
                 dns.header.qr, dns.header.rcode = 1, 2
@@ -886,6 +884,8 @@ class PathProxyResolver:
             if res_dns.header.id != dns.header.id:
                 raise ValueError("Transaction ID mismatch")
             res_dns.header.id = dns.header.id
+            if dns.q.qtype not in (QTYPE.A, QTYPE.AAAA):
+                return res_dns.pack()
             for section in ["rr", "auth", "ar"]:
                 new_records = []
                 for rr in getattr(res_dns, section):
