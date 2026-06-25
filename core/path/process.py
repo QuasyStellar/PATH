@@ -44,7 +44,7 @@ DOMAIN_FAST_RE = re.compile(
 _DEL_CHARS = str.maketrans("", "", "[]_~:/?#\\@!$&'()*+,;=")
 
 
-@lru_cache(maxsize=1048576)
+@lru_cache(maxsize=65536)
 def _normalize_domain_candidate(line):
     if not line:
         return None
@@ -447,7 +447,17 @@ class Processor:
                             stdout=asyncio.subprocess.DEVNULL,
                             stderr=asyncio.subprocess.DEVNULL,
                         )
-                        await proc.communicate(input=b"cache.clear()\n")
+                        try:
+                            await asyncio.wait_for(
+                                proc.communicate(input=b"cache.clear()\n"),
+                                timeout=5.0
+                            )
+                        except asyncio.TimeoutError:
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
+                            await proc.wait()
                     except Exception:
                         pass
 

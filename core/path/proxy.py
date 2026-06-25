@@ -17,6 +17,48 @@ CLEANUP_INTERVAL = 1800
 CLEANUP_EXPIRY = 7200
 
 
+class IPPool:
+    def __init__(self, network, count):
+        self.network = network
+        self.count = count
+        self.current_offset = 0
+        self.recycled = deque()
+        self.occupied = set()
+
+    def popleft(self):
+        if self.recycled:
+            return self.recycled.popleft()
+        while self.current_offset < self.count:
+            ip_str = str(self.network[1 + self.current_offset])
+            self.current_offset += 1
+            if ip_str not in self.occupied:
+                return ip_str
+        return None
+
+    def append(self, ip_str):
+        self.recycled.append(ip_str)
+
+    def set_occupied(self, occupied_set):
+        self.occupied = occupied_set
+
+    def all_ips(self):
+        for i in range(self.count):
+            yield str(self.network[1 + i])
+
+    def __bool__(self):
+        if self.recycled:
+            return True
+        if self.count - self.current_offset > len(self.occupied):
+            return True
+        offset = self.current_offset
+        while offset < self.count:
+            ip_str = str(self.network[1 + offset])
+            if ip_str not in self.occupied:
+                return True
+            offset += 1
+        return False
+
+
 def log(phase, msg, status="INFO"):
     if status == "DEBUG" and not config.debug:
         return
@@ -71,7 +113,8 @@ class IPManager:
                     seq = await self.r.get("path:sequence")
                     self.last_seq = int(seq) if seq else 0
                     await self.init_pool(
-                        self.resolver._all_ips_v4, self.resolver._all_ips_v6
+                        self.resolver.ip_pool_v4.all_ips(),
+                        self.resolver.ip_pool_v6.all_ips() if self.resolver.net_v6 else []
                     )
                     if not any(
                         t.get_name() == "listen_updates" for t in self.resolver.bg_tasks
@@ -104,6 +147,20 @@ class IPManager:
                 backoff = min(backoff * 2, 300)
 
     async def get_fake_ip(self, real_ip, is_v6=False):
+        cache = self.l1_cache_v6 if is_v6 else self.l1_cache_v4
+        if real_ip in cache:
+            data = cache[real_ip]
+            now = time.time()
+            if now - data[1] <= 7200:
+                fake = data[0]
+                needs_kernel_refresh = now - data[2] > 5400
+                needs_redis_refresh = self.is_cluster and (now - data[3] > 1800)
+                if not needs_kernel_refresh and not needs_redis_refresh:
+                    if self.resolver.known_kernel_state.get(fake) == real_ip:
+                        cache.move_to_end(real_ip)
+                        data[1] = now
+                        return fake
+
         async with self.resolver.lock:
             cache = self.l1_cache_v6 if is_v6 else self.l1_cache_v4
             f2r = self.f2r_v6 if is_v6 else self.f2r_v4
@@ -161,7 +218,8 @@ class IPManager:
                 fake = await self._get_redis(real_ip, is_v6)
                 if not fake:
                     await self.init_pool(
-                        self.resolver._all_ips_v4, self.resolver._all_ips_v6
+                        self.resolver.ip_pool_v4.all_ips(),
+                        self.resolver.ip_pool_v6.all_ips() if self.resolver.net_v6 else []
                     )
                     fake = await self._get_redis(real_ip, is_v6)
 
@@ -184,6 +242,9 @@ class IPManager:
                             old_fake = d[0]
                             if f2r.get(old_fake) == old_real_evict:
                                 del f2r[old_fake]
+                            self.resolver.enqueue_nft(
+                                ("del", "v6" if is_v6 else "v4", old_fake, old_real_evict)
+                            )
             return fake
         finally:
             async with self.resolver.lock:
@@ -531,9 +592,14 @@ class IPManager:
                     tmp_key = f"{key}:init_tmp"
                     await self.r.delete(tmp_key)
 
-                    chunk_size = 5000
-                    for i in range(0, len(pool), chunk_size):
-                        await self.r.rpush(tmp_key, *pool[i : i + chunk_size])
+                    chunk = []
+                    for ip in pool:
+                        chunk.append(ip)
+                        if len(chunk) >= 5000:
+                            await self.r.rpush(tmp_key, *chunk)
+                            chunk = []
+                    if chunk:
+                        await self.r.rpush(tmp_key, *chunk)
 
                     await self.r.rename(tmp_key, key)
                     await self.r.set(init_flag, "1")
@@ -613,27 +679,14 @@ class PathProxyResolver:
         )
 
         self.net_v4 = IPv4Network(f"{f4}.0.0/{m4}")
-        self.v4_count = self.net_v4.num_addresses - 2
+        self.v4_count = min(self.net_v4.num_addresses - 2, 262144)
         self.net_v6 = IPv6Network(f"{f6}/{m6}") if self.enable_ipv6 else None
-        self.v6_count = (self.net_v6.num_addresses - 2) if self.net_v6 else 0
+        self.v6_count = min(self.net_v6.num_addresses - 2, 262144) if self.net_v6 else 0
 
         self.l1_limit = max(100000, min(self.v4_count + self.v6_count, 1000000))
 
-        self._all_ips_v4 = [
-            str(addr) for i, addr in enumerate(self.net_v4.hosts()) if i < self.v4_count
-        ]
-        self._all_ips_v6 = (
-            [
-                str(addr)
-                for i, addr in enumerate(self.net_v6.hosts())
-                if i < self.v6_count
-            ]
-            if self.net_v6
-            else []
-        )
-
-        self.ip_pool_v4 = deque(self._all_ips_v4)
-        self.ip_pool_v6 = deque(self._all_ips_v6)
+        self.ip_pool_v4 = IPPool(self.net_v4, self.v4_count)
+        self.ip_pool_v6 = IPPool(self.net_v6, self.v6_count) if self.net_v6 else None
         self.nft_queue = asyncio.Queue(maxsize=50000)
         self.lock = asyncio.Lock()
         self.running = True
@@ -642,6 +695,7 @@ class PathProxyResolver:
         self.state_lock = asyncio.Lock()
         self.nft_exec_lock = asyncio.Lock()
         self.sem = asyncio.Semaphore(1000)
+        self.active_tasks = 0
         self.bg_tasks = set()
         self._recover_scheduled = False
         self.last_full_recover = time.time()
@@ -829,6 +883,8 @@ class PathProxyResolver:
                 dns.header.qr, dns.header.rcode = 1, 2
                 return dns.pack()
             res_dns = DNSRecord.parse(res_pkt)
+            if res_dns.header.id != dns.header.id:
+                raise ValueError("Transaction ID mismatch")
             res_dns.header.id = dns.header.id
             for section in ["rr", "auth", "ar"]:
                 new_records = []
@@ -1097,11 +1153,11 @@ class PathProxyResolver:
                         all_nft_cmds.extend(actual_adds)
 
             occ_v4, occ_v6 = set(mgr.f2r_v4.keys()), set(mgr.f2r_v6.keys())
-            self.ip_pool_v4 = deque([ip for ip in self._all_ips_v4 if ip not in occ_v4])
+            self.ip_pool_v4 = IPPool(self.net_v4, self.v4_count)
+            self.ip_pool_v4.set_occupied(occ_v4)
             if self.net_v6:
-                self.ip_pool_v6 = deque(
-                    [ip for ip in self._all_ips_v6 if ip not in occ_v6]
-                )
+                self.ip_pool_v6 = IPPool(self.net_v6, self.v6_count)
+                self.ip_pool_v6.set_occupied(occ_v6)
 
         if all_nft_cmds:
             await self.run_nft(all_nft_cmds)
@@ -1130,9 +1186,10 @@ class UDP(asyncio.DatagramProtocol):
         self.transport = transport
 
     def datagram_received(self, data, addr):
-        if self.resolver.sem.locked():
+        if self.resolver.active_tasks >= 1000:
             log("UDP", f"Queue full, dropping query from {addr[0]}", "WARNING")
             return
+        self.resolver.active_tasks += 1
         self.resolver.create_bg_task(self.run(data, addr), f"udp_{addr}")
 
     async def run(self, data, addr):
@@ -1143,6 +1200,8 @@ class UDP(asyncio.DatagramProtocol):
                     self.transport.sendto(resp, addr)
         except Exception as e:
             log("UDP", f"Request failed: {e}", "ERROR")
+        finally:
+            self.resolver.active_tasks -= 1
 
 
 class TCP:
@@ -1228,7 +1287,8 @@ async def main():
         resolver.create_bg_task(resolver.garbage_collector(), "garbage_collector")
         if resolver.ip_manager.is_cluster:
             await resolver.ip_manager.init_pool(
-                list(resolver.ip_pool_v4), list(resolver.ip_pool_v6)
+                resolver.ip_pool_v4.all_ips(),
+                resolver.ip_pool_v6.all_ips() if resolver.net_v6 else []
             )
             resolver.create_bg_task(
                 resolver.ip_manager.listen_updates(), "listen_updates"

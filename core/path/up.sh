@@ -30,6 +30,7 @@ table inet path {
     chain input {
         type filter hook input priority 0; policy accept;
         iifname "lo" accept
+        ct state established,related accept
         ip saddr @deny_v4 drop
         $( [[ "$ENABLE_IPV6" == "y" ]] && echo "ip6 saddr @deny_v6 drop" )
         ip saddr $ALLOWED_V4 tcp dport 6379 accept
