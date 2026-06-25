@@ -884,7 +884,7 @@ class PathProxyResolver:
             if res_dns.header.id != dns.header.id:
                 raise ValueError("Transaction ID mismatch")
             res_dns.header.id = dns.header.id
-            if dns.q.qtype not in (QTYPE.A, QTYPE.AAAA):
+            if dns.q.qtype not in (QTYPE.A, QTYPE.AAAA, 64, 65):
                 return res_dns.pack()
             for section in ["rr", "auth", "ar"]:
                 new_records = []
@@ -907,6 +907,46 @@ class PathProxyResolver:
                             rr.rdata = (
                                 A(fake_ip) if rr.rtype == QTYPE.A else AAAA(fake_ip)
                             )
+                            rr.ttl = min(rr.ttl, 600)
+                    elif rr.rtype in (64, 65):
+                        if hasattr(rr.rdata, "params"):
+                            new_params = []
+                            for k, v in rr.rdata.params:
+                                if k == 4:  # ipv4hint
+                                    new_val = bytearray()
+                                    for i in range(0, len(v), 4):
+                                        chunk = v[i:i+4]
+                                        if len(chunk) == 4:
+                                            real_ip = socket.inet_ntoa(chunk)
+                                            fake_ip = await self.ip_manager.get_fake_ip(
+                                                real_ip, is_v6=False
+                                            )
+                                            if fake_ip:
+                                                new_val.extend(socket.inet_aton(fake_ip))
+                                            else:
+                                                new_val.extend(chunk)
+                                        else:
+                                            new_val.extend(chunk)
+                                    new_params.append((k, new_val))
+                                elif k == 6:  # ipv6hint
+                                    new_val = bytearray()
+                                    for i in range(0, len(v), 16):
+                                        chunk = v[i:i+16]
+                                        if len(chunk) == 16:
+                                            real_ip = socket.inet_ntop(socket.AF_INET6, chunk)
+                                            fake_ip = await self.ip_manager.get_fake_ip(
+                                                real_ip, is_v6=True
+                                            )
+                                            if fake_ip:
+                                                new_val.extend(socket.inet_pton(socket.AF_INET6, fake_ip))
+                                            else:
+                                                new_val.extend(chunk)
+                                        else:
+                                            new_val.extend(chunk)
+                                    new_params.append((k, new_val))
+                                else:
+                                    new_params.append((k, v))
+                            rr.rdata.params = new_params
                             rr.ttl = min(rr.ttl, 600)
                     new_records.append(rr)
                 setattr(res_dns, section, new_records)
