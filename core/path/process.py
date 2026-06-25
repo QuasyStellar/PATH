@@ -44,7 +44,7 @@ DOMAIN_FAST_RE = re.compile(
 _DEL_CHARS = str.maketrans("", "", "[]_~:/?#\\@!$&'()*+,;=")
 
 
-@lru_cache(maxsize=65536)
+@lru_cache(maxsize=1048576)
 def _normalize_domain_candidate(line):
     if not line:
         return None
